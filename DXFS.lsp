@@ -20,6 +20,13 @@
 ;;;   - "Inside" = the object's bounding box is fully inside the rectangle
 ;;;     (same rule as a window selection), checked in the database, so it
 ;;;     works even when the area is zoomed off-screen.
+;;;   - XCLIPped blocks are judged by the part that is actually VISIBLE
+;;;     (clip boundary), not by the whole block. In the DXF they can be
+;;;       Keep : written as the block + its xclip (AutoCAD shows it clipped)
+;;;       Trim : written as loose objects cut at the clip boundary, so any
+;;;              DXF viewer / CAM tool shows exactly what you see (needs
+;;;              XCT.lsp loaded). The drawing itself is not changed.
+;;;     You are asked once per DXFS / DXFSA run, when such a block is found.
 ;;;   - Layer "DXF" is created red and non-plotting.
 ;;;   - Uses the shared _AuthCheck from MM.lsp, like the rest of the suite.
 ;;; ===========================================================================
@@ -50,12 +57,20 @@
     (mapcar '(lambda (v) (cons v (getvar v))) '("CMDECHO" "FILEDIA")))
   (setvar "CMDECHO" 0)
   (setvar "FILEDIA" 0)
-  (setq *dxfs-olderr* *error*
-        *error*       _DXFS-Error)
+  (setq *dxfs-olderr*   *error*
+        *error*         _DXFS-Error
+        *dxfs-clipcache* nil      ; ((ename . visible-bbox) ...) for this run
+        *dxfs-cliprun*   nil      ; clip mode already asked in this run?
+        ;; sn.lsp's auto-Q reactor must not tag the temporary objects made
+        ;; here (clip outlines, trimmed pieces) - queue restored at the end
+        *dxfs-qsave*     *Q-pending*)
   (vla-StartUndoMark *dxfs-doc*)
 )
 
 (defun _DXFS-End ()
+  (foreach e *dxfs-temps* (if (entget e) (entdel e)))
+  (setq *dxfs-temps* nil)
+  (setq *Q-pending* *dxfs-qsave*)
   (foreach pair *dxfs-oldvars* (setvar (car pair) (cdr pair)))
   (setq *error* *dxfs-olderr*)
   (vl-catch-all-apply 'vla-EndUndoMark (list *dxfs-doc*))
@@ -138,7 +153,127 @@
 )
 
 ;;; ===========================================================================
-;;; [3] Collect every object fully inside the rectangle (current space)
+;;; [3] XCLIPped blocks
+;;; ===========================================================================
+;;; run a command without sn.lsp's Q reactor picking up what it creates
+(defun _DXFS-Cmd (lst)
+  (setq *Q-pending* nil)
+  (apply 'command lst)
+  (while (> (getvar "CMDACTIVE") 0) (command ""))
+  (setq *Q-pending* nil)
+)
+
+;;; T when the INSERT has an active XCLIP (spatial filter, display on)
+(defun _DXFS-Clipped-p (e / xd d f)
+  (and (= (cdr (assoc 0 (entget e))) "INSERT")
+       (setq xd (cdr (assoc 360 (entget e))))
+       (setq d (dictsearch xd "ACAD_FILTER"))
+       (setq f (dictsearch (cdr (assoc -1 d)) "SPATIAL"))
+       (/= 0 (cond ((cdr (assoc 71 f))) (1)))
+  )
+)
+
+;;; WCS polyline of the clip boundary (XCLIP > generate Polyline). The
+;;; caller deletes it.
+(defun _DXFS-ClipPoly (e / mark new)
+  (setq mark (entlast))
+  (_DXFS-Cmd (list "_.XCLIP" e "" "_P"))
+  (setq new (entlast))
+  (if (not (eq new mark)) new)
+)
+
+;;; visible extents of a clipped block = its extents AND the clip boundary
+(defun _DXFS-ClipBBox (e full / hit pl cb)
+  (if (setq hit (assoc e *dxfs-clipcache*))
+    (cdr hit)
+    (progn
+      (if (setq pl (_DXFS-ClipPoly e))
+        (progn
+          (setq cb (_DXFS-BBox pl))
+          (entdel pl)
+          (setq cb (list (list (max (car (car full)) (car (car cb)))
+                               (max (cadr (car full)) (cadr (car cb))))
+                         (list (min (car (cadr full)) (car (cadr cb)))
+                               (min (cadr (cadr full)) (cadr (cadr cb))))))
+        )
+        (setq cb full)
+      )
+      (setq *dxfs-clipcache* (cons (cons e cb) *dxfs-clipcache*))
+      cb
+    )
+  )
+)
+
+;;; Keep / Trim - asked once per run; the answer is remembered as default
+(defun _DXFS-ClipMode (/ ans)
+  (if (not *dxfs-cliprun*)
+    (progn
+      (if (not *dxfs-clipmode*) (setq *dxfs-clipmode* "Trim"))
+      (initget "Keep Trim")
+      (setq ans (getkword (strcat "\nXclipped block(s) found. Keep = block + xclip, "
+                                  "Trim = cut at clip boundary. [Keep/Trim] <"
+                                  *dxfs-clipmode* ">: ")))
+      (if ans (setq *dxfs-clipmode* ans))
+      (if (and (= *dxfs-clipmode* "Trim") (not (boundp '_XCT-ExplodeAll)))
+        (progn
+          (princ "\n[DXFS] XCT.lsp is not loaded - xclipped blocks are exported as Keep.")
+          (setq *dxfs-clipmode* "Keep")
+        )
+      )
+      (setq *dxfs-cliprun* T)
+    )
+  )
+  *dxfs-clipmode*
+)
+
+;;; Trim mode: replace each clipped block in ss by a trimmed, exploded copy.
+;;; The copies are temporary (recorded in *dxfs-temps*, removed after export).
+(defun _DXFS-TrimClipped (ss / out i e pl pts bnd bmin bmax cp atoms e2 typ)
+  (setq out (ssadd) i 0 *xct-doc* *dxfs-doc*)
+  (repeat (sslength ss)
+    (setq e (ssname ss i))
+    (if (and (_DXFS-Clipped-p e) (setq pl (_DXFS-ClipPoly e)))
+      (progn
+        (setq pts  (mapcar '(lambda (p) (list (car p) (cadr p))) (_XCT-Sample pl))
+              bnd  (vlax-ename->vla-object pl)
+              bmin (list (apply 'min (mapcar 'car pts)) (apply 'min (mapcar 'cadr pts)))
+              bmax (list (apply 'max (mapcar 'car pts)) (apply 'max (mapcar 'cadr pts)))
+              *xct-etol* (* 1e-6 (max 1.0 (distance bmin bmax))))
+        (setq cp (vla-Copy (vlax-ename->vla-object e)))
+        (if (setq atoms (_XCT-ExplodeAll cp 0))
+          (progn
+            (vla-Delete cp)
+            (foreach o atoms (_XCT-Process o bnd pts bmin bmax))
+            ;; everything created after the clip outline = the trimmed pieces
+            (setq e2 pl)
+            (while (setq e2 (entnext e2))
+              (setq typ (cdr (assoc 0 (entget e2))))
+              (if (not (member typ '("VERTEX" "SEQEND" "ATTRIB")))
+                (progn
+                  (ssadd e2 out)
+                  (setq *dxfs-temps* (cons e2 *dxfs-temps*))
+                )
+              )
+            )
+            (entdel pl)
+          )
+          (progn            ; could not explode -> export the block as it is
+            (vla-Delete cp)
+            (entdel pl)
+            (ssadd e out)
+          )
+        )
+      )
+      (ssadd e out)
+    )
+    (setq i (1+ i))
+  )
+  (setq *Q-pending* nil)
+  out
+)
+
+;;; ===========================================================================
+;;; [4] Collect every object fully inside the rectangle (current space)
 ;;; ===========================================================================
 (defun _DXFS-Collect (pmin pmax / ss out i e bb ll ur)
   (setq ss  (ssget "_X" (list (cons 410 (getvar "CTAB"))))
@@ -150,6 +285,12 @@
       (if (and (/= (strcase (cdr (assoc 8 (entget e)))) (strcase *dxfs-layer*))
                (setq bb (_DXFS-BBox e)))
         (progn
+          ;; xclipped block overlapping the area: judge by its visible part
+          (if (and (_DXFS-Clipped-p e)
+                   (<= (car (car bb)) (car pmax)) (<= (cadr (car bb)) (cadr pmax))
+                   (>= (car (cadr bb)) (car pmin)) (>= (cadr (cadr bb)) (cadr pmin)))
+            (setq bb (_DXFS-ClipBBox e bb))
+          )
           (setq ll (car bb) ur (cadr bb))
           (if (and (>= (car ll)  (- (car pmin)  *dxfs-fuzz*))
                    (>= (cadr ll) (- (cadr pmin) *dxfs-fuzz*))
@@ -166,7 +307,7 @@
 )
 
 ;;; ===========================================================================
-;;; [4] File name helpers
+;;; [5] File name helpers
 ;;; ===========================================================================
 (defun _DXFS-BaseName ()
   (vl-filename-base (getvar "DWGNAME"))
@@ -225,9 +366,29 @@
 )
 
 ;;; ===========================================================================
-;;; [5] Write a selection set to a .dxf file (DXFOUT > Objects)
+;;; [6] Write a selection set to a .dxf file (DXFOUT > Objects)
 ;;; ===========================================================================
-(defun _DXFS-Export (ss fname)
+(defun _DXFS-HasClipped (ss / i hit)
+  (setq i 0)
+  (repeat (sslength ss)
+    (if (_DXFS-Clipped-p (ssname ss i)) (setq hit T))
+    (setq i (1+ i))
+  )
+  hit
+)
+
+(defun _DXFS-Export (ss fname / ok)
+  (if (and (_DXFS-HasClipped ss) (= (_DXFS-ClipMode) "Trim"))
+    (setq ss (_DXFS-TrimClipped ss))
+  )
+  (setq ok (_DXFS-Write ss fname))
+  ;; temporary trimmed pieces are only for the file
+  (foreach e *dxfs-temps* (if (entget e) (entdel e)))
+  (setq *dxfs-temps* nil)
+  ok
+)
+
+(defun _DXFS-Write (ss fname)
   (if (findfile fname) (vl-file-delete fname))
   (if (findfile fname)
     (progn
@@ -237,15 +398,14 @@
     (progn
       ;; file name -> Objects -> select -> finish selection; any prompt still
       ;; open afterwards (decimal accuracy etc.) gets its default via Enter
-      (command "_.DXFOUT" fname "_O" ss "")
-      (while (> (getvar "CMDACTIVE") 0) (command ""))
+      (_DXFS-Cmd (list "_.DXFOUT" fname "_O" ss ""))
       (findfile fname)
     )
   )
 )
 
 ;;; ===========================================================================
-;;; [6] DXFS - pick areas one by one
+;;; [7] DXFS - pick areas one by one
 ;;; ===========================================================================
 (defun c:DXFS (/ dir p1 p2 w1 w2 pmin pmax rect ss name fname cnt)
   (if (_AuthCheck)
@@ -290,7 +450,7 @@
 )
 
 ;;; ===========================================================================
-;;; [7] DXFSA - re-export every "DXF" rectangle in the current space
+;;; [8] DXFSA - re-export every "DXF" rectangle in the current space
 ;;; ===========================================================================
 (defun c:DXFSA (/ dir rs i e bb items name taken used ss fname cnt skip)
   (if (_AuthCheck)
