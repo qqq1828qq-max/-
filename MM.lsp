@@ -177,6 +177,7 @@
 (defun c:MyTools/Pal_MyTools/btntxf#OnClicked      (/) (dcl-SendString "txf\n"))
 (defun c:MyTools/Pal_MyTools/btndxfs#OnClicked     (/) (dcl-SendString "dxfs\n"))
 (defun c:MyTools/Pal_MyTools/btndxfsa#OnClicked    (/) (dcl-SendString "dxfsa\n"))
+(defun c:MyTools/Pal_MyTools/btnxct#OnClicked      (/) (dcl-SendString "xct\n"))
 (defun c:MyTools/Pal_MyTools/btnClose#OnClicked (/)
   (dcl-form-close MyTools/Pal_MyTools)
 )
