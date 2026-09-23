@@ -243,7 +243,7 @@
         (if (setq atoms (_XCT-ExplodeAll cp 0))
           (progn
             (vla-Delete cp)
-            (foreach o atoms (_XCT-Process o bnd pts bmin bmax))
+            (foreach o atoms (_XCT-SafeProcess o bnd pts bmin bmax))
             ;; everything created after the clip outline = the trimmed pieces
             (setq e2 pl)
             (while (setq e2 (entnext e2))

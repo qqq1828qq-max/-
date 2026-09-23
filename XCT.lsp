@@ -397,10 +397,20 @@
   (if *xct-closed*
     (while (> prm (+ *xct-ep* *xct-pfuzz*)) (setq prm (- prm *xct-period*)))
   )
-  (min prm *xct-ep*)
+  ;; clamp into the curve's range: getPointAtParam returns nil for a
+  ;; parameter even a hair outside it (floating-point round-off)
+  (max *xct-sp* (min prm *xct-ep*))
 )
 
-(defun _XCT-PtAt (o prm) (vlax-curve-getPointAtParam o (_XCT-Norm prm)))
+(defun _XCT-PtAt (o prm / p)
+  (setq prm (_XCT-Norm prm))
+  (cond
+    ((vlax-curve-getPointAtParam o prm))
+    ((equal prm *xct-sp* *xct-pfuzz*) (vlax-curve-getStartPoint o))
+    ((equal prm *xct-ep* *xct-pfuzz*) (vlax-curve-getEndPoint o))
+    (T (_XCT-Fail "no point on curve"))
+  )
+)
 
 ;;; sorted, de-duplicated parameters where the curve crosses the frame
 (defun _XCT-CutParams (o bnd / v pts prm lst out)
@@ -523,11 +533,22 @@
 )
 
 ;;; returns 'keep / 'trim / 'del
-(defun _XCT-TrimCurve (o bnd poly / cuts bounds pieces runs t0 t1)
+(defun _XCT-TrimCurve (o bnd poly / bb)
   (setq *xct-sp*     (vlax-curve-getStartParam o)
         *xct-ep*     (vlax-curve-getEndParam o)
-        *xct-closed* (vlax-curve-isClosed o)
-        *xct-period* (- *xct-ep* *xct-sp*))
+        *xct-closed* (vlax-curve-isClosed o))
+  (if (and (numberp *xct-sp*) (numberp *xct-ep*) (> *xct-ep* *xct-sp*))
+    (_XCT-TrimCurve2 o bnd poly)
+    ;; degenerate curve (no parameter range) -> judged by its centre, like text
+    (progn
+      (setq bb (_XCT-BBox o))
+      (_XCT-KeepByCentre o poly (car bb) (cadr bb))
+    )
+  )
+)
+
+(defun _XCT-TrimCurve2 (o bnd poly / cuts bounds pieces runs t0 t1)
+  (setq *xct-period* (- *xct-ep* *xct-sp*))
   (setq cuts (_XCT-CutParams o bnd))
   (setq bounds (if *xct-closed*
                  (if cuts (append cuts (list (+ (car cuts) *xct-period*)))
@@ -548,6 +569,33 @@
      (vla-Delete o)
      'trim
     )
+  )
+)
+
+;;; deliberate error, caught by _XCT-SafeProcess
+(defun _XCT-Fail (msg)
+  (setq *xct-failmsg* msg)
+  (/ 1 0)
+)
+
+;;; _XCT-Process guarded: if anything goes wrong on one object, whatever was
+;;; half-made for it is removed, the object itself is left untouched, and
+;;; the run carries on. Returns 'keep / 'trim / 'del / 'err.
+(defun _XCT-SafeProcess (o bnd poly bmin bmax / mark r e typ)
+  (setq mark (entlast) *xct-failmsg* nil)
+  (setq typ (vl-catch-all-apply 'vla-get-ObjectName (list o)))
+  (setq r (vl-catch-all-apply '_XCT-Process (list o bnd poly bmin bmax)))
+  (if (vl-catch-all-error-p r)
+    (progn
+      (setq e mark)
+      (while (setq e (entnext e)) (entdel e))
+      (if (not *xct-lasterr*)
+        (setq *xct-lasterr*
+          (strcat (if (vl-catch-all-error-p typ) "?" typ) ": "
+                  (cond (*xct-failmsg*) ((vl-catch-all-error-message r))))))
+      'err
+    )
+    r
   )
 )
 
@@ -589,6 +637,7 @@
 )
 
 (defun _XCT-KeepByCentre (o poly ll ur)
+  (if (not (and ll ur)) (_XCT-Fail "no extents"))
   (if (_XCT-Inside (mapcar '(lambda (a b) (/ (+ a b) 2.0)) ll ur) poly)
     'keep
     (progn (vla-Delete o) 'del)
@@ -599,7 +648,7 @@
 ;;; [7] XCT command
 ;;; ===========================================================================
 (defun c:XCT (/ frame bnd poly frameEnt bmin bmax ss i ref atoms r o
-                nBlk nKeep nTrim nDel nFail)
+                nBlk nKeep nTrim nDel nFail nErr)
   (if (_AuthCheck)
     (progn
       (_XCT-Begin)
@@ -617,17 +666,26 @@
           (if (or (null ss) (= (sslength ss) 0))
             (princ "\n[XCT] No blocks selected.")
             (progn
-              (setq i 0 nBlk 0 nKeep 0 nTrim 0 nDel 0 nFail 0)
+              (setq i 0 nBlk 0 nKeep 0 nTrim 0 nDel 0 nFail 0 nErr 0 *xct-lasterr* nil)
               (repeat (sslength ss)
                 (setq ref (vlax-ename->vla-object (ssname ss i)))
-                (if (setq atoms (_XCT-ExplodeAll ref 0))
+                (setq atoms (vl-catch-all-apply '_XCT-ExplodeAll (list ref 0)))
+                (if (vl-catch-all-error-p atoms)
+                  (progn
+                    (if (not *xct-lasterr*)
+                      (setq *xct-lasterr* (strcat "explode: " (vl-catch-all-error-message atoms))))
+                    (setq atoms nil)
+                  )
+                )
+                (if atoms
                   (progn
                     (vla-Delete ref)
                     (setq nBlk (1+ nBlk))
                     (foreach o atoms
-                      (setq r (_XCT-Process o bnd poly bmin bmax))
+                      (setq r (_XCT-SafeProcess o bnd poly bmin bmax))
                       (cond ((= r 'keep) (setq nKeep (1+ nKeep)))
                             ((= r 'trim) (setq nTrim (1+ nTrim)))
+                            ((= r 'err)  (setq nErr (1+ nErr)))
                             (T (setq nDel (1+ nDel))))
                     )
                   )
@@ -640,6 +698,12 @@
                              (itoa nDel) " deleted (outside)."
                              (if (> nFail 0)
                                (strcat " " (itoa nFail) " block(s) could not be exploded - left as is.")
+                               "")
+                             (if (> nErr 0)
+                               (strcat "\n[XCT] " (itoa nErr) " object(s) could not be cut - left uncut.")
+                               "")
+                             (if *xct-lasterr*
+                               (strcat "\n[XCT] First problem: " *xct-lasterr*)
                                "")))
             )
           )
