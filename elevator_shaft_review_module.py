@@ -655,7 +655,9 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                     layer = e.dxf.layer
                 except Exception:
                     layer = ''
-                if _layer_matches(layer):
+                # ④가 만든 결과 레이어('승강로 사이즈')는 레이어명에 '승강'이 들어 있어
+                # 결과 DXF를 다시 입력하면 심볼로 오인되므로 제외한다.
+                if layer != '승강로 사이즈' and _layer_matches(layer):
                     pts = _entity_points(e)
                     if pts:
                         cx = sum(p[0] for p in pts) / len(pts)
@@ -1259,6 +1261,145 @@ def _ai_fix_parallel_group(segs, members, api_key, model, provider, max_lines=70
     return out
 
 
+# ──────────────────────────────────────────────────────────────
+#  도면 자체의 승강로 규격 주석("W:2400xD:2350") 대조/보정
+#
+#  실무 도면은 승강로마다 "/ W:가로xD:세로" 주석을 달아두는 경우가 많다. 이 값은
+#  벽 스냅 결과의 가장 확실한 정답지다 — 스냅이 이중선 벽의 엉뚱한 줄이나 옆 공간
+#  벽에 붙어 치수가 틀어졌을 때(예: 주석 2450x2500인데 2700x3060으로 측정) 바로
+#  잡아낼 수 있고, 주석 크기에 맞는 벽선 쌍을 골라 다시 스냅할 수도 있다.
+# ──────────────────────────────────────────────────────────────
+_SPEC_TEXT_RE = re.compile(r'W\s*:\s*(\d{3,5})\s*[xX×]\s*D\s*:\s*(\d{3,5})')
+SPEC_SINGLE_MAX_MM = 4500.0   # 이보다 크면 병렬 2대 합산 주석(예: W:5200xD:2600) — 단일 칸 규격으로 안 씀
+SPEC_MATCH_TOL_MM = 100.0
+
+
+def _collect_spec_text_points(msp, max_block_depth: int = 6):
+    """도면 전체(중첩 블록 포함)에서 "W:####xD:####" 주석의 (x, y, W, D)를 모은다."""
+    points = []
+
+    def _walk(entities, depth):
+        for e in entities:
+            try:
+                etype = e.dxftype()
+            except Exception:
+                continue
+            if etype == 'INSERT':
+                if depth >= max_block_depth:
+                    continue
+                try:
+                    _walk(e.virtual_entities(), depth + 1)
+                except Exception:
+                    continue
+            elif etype in ('TEXT', 'MTEXT'):
+                try:
+                    text = e.dxf.text if etype == 'TEXT' else e.text
+                    x, y = e.dxf.insert.x, e.dxf.insert.y
+                except Exception:
+                    continue
+                m = _SPEC_TEXT_RE.search(text or '')
+                if m:
+                    points.append((x, y, float(m.group(1)), float(m.group(2))))
+
+    try:
+        _walk(msp, 0)
+    except Exception:
+        pass
+    return points
+
+
+def _assign_specs(centers, spec_points, radius_mm: float = 3500.0):
+    """규격 주석을 가장 가까운 승강로 1곳에 배정한다(_assign_capacities와 같은 방식 —
+    텍스트 기준 최근접). 병렬 2대 합산 주석(W 또는 D가 SPEC_SINGLE_MAX_MM 초과)은
+    단일 칸 규격이 아니므로 제외한다. 반환: {center_index: (W, D)}"""
+    best = {}
+    for x, y, w, d in spec_points:
+        if w > SPEC_SINGLE_MAX_MM or d > SPEC_SINGLE_MAX_MM:
+            continue
+        cand = None
+        for ci, (cx, cy) in enumerate(centers):
+            dist = math.hypot(x - cx, y - cy)
+            if dist <= radius_mm and (cand is None or dist < cand[0]):
+                cand = (dist, ci)
+        if cand and (cand[1] not in best or cand[0] < best[cand[1]][0]):
+            best[cand[1]] = (cand[0], (w, d))
+    return {ci: wd for ci, (_d, wd) in best.items()}
+
+
+def _matches_spec(width, depth, spec, tol: float = SPEC_MATCH_TOL_MM):
+    """측정 폭/깊이가 주석 규격과 (가로세로 서로 바뀐 경우까지 포함해) 오차 범위 안인지."""
+    sw, sd = spec
+    return ((abs(width - sw) <= tol and abs(depth - sd) <= tol) or
+            (abs(width - sd) <= tol and abs(depth - sw) <= tol))
+
+
+def _snap_to_expected_size(segs, cluster, spec, tol: float = 60.0, min_cover: float = 0.5):
+    """주석 규격(spec=(W,D))에 맞는 간격의 벽선 쌍을 골라 사각형을 만든다. 심볼 중심을
+    포함하고 네 변이 모두 해당 변 길이의 min_cover 이상 실제 벽선으로 덮이는 조합 중
+    덮임 합이 가장 큰 것을 택한다(가로세로가 뒤바뀐 방향도 시도). 없으면 None."""
+    center = cluster['center']
+    x0, y0, x1, y1 = cluster['bbox']
+    angle = _dominant_wall_angle_deg(segs, center, max(x1 - x0, y1 - y0) * 3.0 + 3000.0)
+    if abs(angle - 90.0) < 1.0:
+        angle = 0.0
+    R = max(spec) + 1500.0
+    verticals, horizontals = _local_wall_lines(segs, center, angle, (-R, -R, R, R))
+    if len(verticals) < 2 or len(horizontals) < 2:
+        return None
+    slack = 100.0
+    best = None
+    for ew, ed in ((spec[0], spec[1]), (spec[1], spec[0])):
+        xpairs = [(a, b) for a in verticals for b in verticals
+                  if a['pos'] < b['pos'] and abs((b['pos'] - a['pos']) - ew) <= tol
+                  and a['pos'] <= slack and b['pos'] >= -slack]
+        ypairs = [(a, b) for a in horizontals for b in horizontals
+                  if a['pos'] < b['pos'] and abs((b['pos'] - a['pos']) - ed) <= tol
+                  and a['pos'] <= slack and b['pos'] >= -slack]
+        for xa, xb in xpairs:
+            for ya, yb in ypairs:
+                covs = (_line_coverage(xa, ya['pos'], yb['pos']), _line_coverage(xb, ya['pos'], yb['pos']),
+                        _line_coverage(ya, xa['pos'], xb['pos']), _line_coverage(yb, xa['pos'], xb['pos']))
+                if min(covs) < min_cover:
+                    continue
+                score = sum(covs)
+                if best is None or score > best[0]:
+                    best = (score, xa['pos'], xb['pos'], ya['pos'], yb['pos'])
+    if not best:
+        return None
+    _s, lx0, lx1, ly0, ly1 = best
+    cx, cy = center
+    corners = [(lx0, ly0), (lx1, ly0), (lx1, ly1), (lx0, ly1)]
+    pts = [_rotate_point(cx + px, cy + py, angle, center) for px, py in corners]
+    return {'points': pts, 'width_mm': round(lx1 - lx0, 1), 'depth_mm': round(ly1 - ly0, 1)}
+
+
+def _result_tag(r):
+    """③ 결과 한 건의 신뢰도 표시(미리보기·④ 도면 라벨·⑤ 검토표 공용)."""
+    tag = {'wall_snap': '', 'ai_group_fix': ' ✎AI보정', 'spec_snap': ' ✎주석규격재스냅'}.get(
+        r.get('source'), ' ⚠벽미검출')
+    if r.get('spec') and r.get('spec_ok') is False:
+        tag += f" ⚠도면주석불일치(W:{r['spec'][0]:.0f}xD:{r['spec'][1]:.0f})"
+    return tag
+
+
+def _assign_core_labels(results):
+    """③ 결과에 검토표와 똑같은 코어 라벨(코어3A 등)을 붙인다. 코어 번호는 그룹
+    (병렬 묶음)의 최소 index 순, 병렬 그룹 안은 A/B/C. 미리보기·④ 도면 라벨·⑤
+    검토표가 모두 이 한 함수의 결과를 써서 번호가 서로 어긋나지 않게 한다.
+    반환: {index: (core_label, is_parallel)}"""
+    groups = {}
+    for r in results:
+        groups.setdefault(r.get('group_id', r['index']), []).append(r)
+    ordered = sorted(groups, key=lambda gid: min(r['index'] for r in groups[gid]))
+    labels = {}
+    for core_no, gid in enumerate(ordered, start=1):
+        members = sorted(groups[gid], key=lambda r: r['index'])
+        parallel = len(members) > 1
+        for sub_i, r in enumerate(members):
+            labels[r['index']] = (f"코어{core_no}" + (chr(ord('A') + sub_i) if parallel else ''), parallel)
+    return labels
+
+
 def write_shaft_layer_dxf(dxf_path: str, shapes, layer_name: str = '승강로 사이즈', suffix: str = '_검토'):
     """원본 DXF는 건드리지 않고 '<원본이름>_검토.dxf' 사본을 만들어, shapes(각 항목
     {'points': [(x,y),...], 'label': str, 'layer': str(선택)}) 를 지정한 레이어에
@@ -1632,9 +1773,9 @@ class ElevatorShaftReviewModule:
         parking_tree_frame.pack(fill='x', pady=(0, 4))
 
         self.tree_parking = ttk.Treeview(
-            parking_tree_frame, columns=('idx', 'w', 'd', 'cap', 'source', 'wall_layer'), show='headings',
+            parking_tree_frame, columns=('idx', 'w', 'd', 'spec', 'cap', 'source', 'wall_layer'), show='headings',
             style=STYLE_TREEVIEW, height=6)
-        for c, t, w in [('idx', '#', 36), ('w', '폭', 60), ('d', '깊이', 60), ('cap', '인승', 50),
+        for c, t, w in [('idx', '코어', 90), ('w', '폭', 60), ('d', '깊이', 60), ('spec', '도면주석', 110), ('cap', '인승', 50),
                         ('source', '출처', 90), ('wall_layer', '사용된 벽 레이어', 220)]:
             self.tree_parking.heading(c, text=t)
             self.tree_parking.column(c, width=w, anchor='center')
@@ -1657,7 +1798,8 @@ class ElevatorShaftReviewModule:
         self._clear_parking_tree()
         for r in self.parking_shaft_results:
             self.tree_parking.insert('', 'end', iid=str(r['index']), values=(
-                r['index'], f"{r['width_mm']:.0f}", f"{r['depth_mm']:.0f}",
+                r.get('core_label', r['index']), f"{r['width_mm']:.0f}", f"{r['depth_mm']:.0f}",
+                (f"{r['spec'][0]:.0f}x{r['spec'][1]:.0f} " + ('✓' if r.get('spec_ok') else '✗')) if r.get('spec') else '',
                 r.get('capacity_guess') or '', r['source'], r.get('wall_layer_used') or '',
             ))
 
@@ -1917,6 +2059,8 @@ class ElevatorShaftReviewModule:
         # 가져가는 오배정이 생길 수 있어, 전역 1:1 배타 매칭으로 한 번에
         # 배정한다 (자세한 이유는 _assign_capacities 설명 참조).
         capacity_by_index = _assign_capacities([c['center'] for c in clusters], capacity_points)
+        spec_by_index = _assign_specs([c['center'] for c in clusters],
+                                      _collect_spec_text_points(msp) if msp else [])
 
         # 승강로끼리 가까이 붙어 있을 때(병렬/나란한 코어, 실측 간격 600~900mm)
         # 벽 검색창을 무작정 넓히면 바로 옆 승강로의 벽(또는 그 너머 외벽)을
@@ -1994,7 +2138,27 @@ class ElevatorShaftReviewModule:
                 'width_mm': round(width_mm, 1), 'depth_mm': round(depth_mm, 1),
                 'capacity_guess': capacity, 'wall_layer_used': used_layer, 'source': source,
                 'group_id': c.get('group_id', i - 1),
+                'spec': spec_by_index.get(i - 1), 'spec_ok': None,
             })
+
+        # ── 도면 규격 주석(W:xD:)과 대조 — 어긋나면 주석 크기에 맞는 벽선 쌍으로 재스냅 ──
+        for r in results:
+            spec = r.get('spec')
+            if not spec:
+                continue
+            if r['source'] != 'symbol_bbox' and _matches_spec(r['width_mm'], r['depth_mm'], spec):
+                r['spec_ok'] = True
+                continue
+            cluster = clusters[r['index'] - 1]
+            for wl in wall_layers:
+                fixed = _snap_to_expected_size(_segs_for(wl), cluster, spec)
+                if fixed:
+                    r.update({'points': fixed['points'], 'width_mm': fixed['width_mm'],
+                              'depth_mm': fixed['depth_mm'], 'wall_layer_used': wl,
+                              'source': 'spec_snap', 'spec_ok': True})
+                    break
+            else:
+                r['spec_ok'] = False
 
         # ── 병렬 그룹 전용 AI 위치 보정 ──
         # 병렬 그룹에 벽 스냅 실패 칸이 하나라도 있으면, 그 그룹만 AI에게 칸별
@@ -2007,7 +2171,8 @@ class ElevatorShaftReviewModule:
             for gid, positions in by_group.items():
                 if len(positions) < 2:
                     continue
-                if all(results[p]['source'] == 'wall_snap' for p in positions):
+                if all(results[p]['source'] in ('wall_snap', 'spec_snap') and results[p]['spec_ok'] is not False
+                       for p in positions):
                     continue
                 members = [clusters[results[p]['index'] - 1] for p in positions]
                 for wl in wall_layers:
@@ -2021,7 +2186,15 @@ class ElevatorShaftReviewModule:
                             'depth_mm': fixed[k]['depth_mm'],
                             'wall_layer_used': wl, 'source': 'ai_group_fix',
                         })
+                        if results[p].get('spec'):
+                            results[p]['spec_ok'] = _matches_spec(
+                                results[p]['width_mm'], results[p]['depth_mm'], results[p]['spec'])
                     break
+
+        # 미리보기·④·⑤가 같은 코어 번호를 쓰도록 라벨을 한 번에 부여한다.
+        for idx, (label, parallel) in _assign_core_labels(results).items():
+            results[idx - 1]['core_label'] = label
+            results[idx - 1]['is_parallel'] = parallel
         return results
 
     def _on_parking_step3_done(self, results):
@@ -2034,7 +2207,7 @@ class ElevatorShaftReviewModule:
             self.btn_step4.config(state='disabled')
             self.btn_step5.config(state='disabled')
             return
-        n_wall = sum(1 for r in results if r['source'] in ('wall_snap', 'ai_group_fix'))
+        n_wall = sum(1 for r in results if r['source'] in ('wall_snap', 'ai_group_fix', 'spec_snap'))
         n_ai = sum(1 for r in results if r['source'] == 'ai_group_fix')
         n_fallback = len(results) - n_wall
         n_cap = sum(1 for r in results if r.get('capacity_guess'))
@@ -2054,8 +2227,8 @@ class ElevatorShaftReviewModule:
         shapes = []
         for r in self.parking_shaft_results:
             cap_part = f" {r['capacity_guess']}인승" if r.get('capacity_guess') else ''
-            tag = {'wall_snap': '', 'ai_group_fix': ' ✎병렬AI보정'}.get(r['source'], ' ⚠벽미검출(심볼윤곽)')
-            label = f"#{r['index']} {r['width_mm']:.0f}x{r['depth_mm']:.0f}{cap_part}{tag}"
+            label = (f"{r.get('core_label', '#' + str(r['index']))} "
+                     f"{r['width_mm']:.0f}x{r['depth_mm']:.0f}{cap_part}{_result_tag(r)}")
             shapes.append({'points': r['points'], 'label': label, 'layer': '승강로 사이즈'})
         out_path = write_shaft_layer_dxf(self.parking_source_path, shapes,
                                           layer_name='승강로 사이즈', suffix='_승강로검토')
@@ -2076,43 +2249,31 @@ class ElevatorShaftReviewModule:
         # 승강로들(group_id가 같음)은 "같은 코어에 나란히 붙은 승강로"로 보고
         # 같은 코어 번호 + 배치="병렬"로, 혼자인 승강로는 배치="단독"으로
         # 검토표에 반영한다(이전에는 전부 "단독"으로 잘못 표시됐었음).
-        groups = {}
-        for r in self.parking_shaft_results:
-            groups.setdefault(r.get('group_id', r['index']), []).append(r)
-        # 그룹 번호는 도면에서 보기 편하도록 그룹 내 최소 index 순으로 부여
-        ordered_group_ids = sorted(groups.keys(), key=lambda gid: min(r['index'] for r in groups[gid]))
-
         n_added = 0
         n_low_conf = 0
-        for core_no, gid in enumerate(ordered_group_ids, start=1):
-            members = sorted(groups[gid], key=lambda r: r['index'])
-            is_parallel = len(members) > 1
-            layout = self.LAYOUT_OPTIONS[1] if is_parallel else self.LAYOUT_OPTIONS[0]  # '병렬' / '단독'
-            for sub_i, r in enumerate(members):
-                # 동 구분은 전체평면도 한 장만으로는 자동으로 알 수 없어 비워두고
-                # (사용자가 셀을 더블클릭해 직접 채움). 병렬 그룹은 같은 코어
-                # 번호에 A/B/C로 구분, 단독은 번호만.
-                core_label = f"코어{core_no}" + (chr(ord('A') + sub_i) if is_parallel else '')
-                # ③단계 미리보기에서는 source가 symbol_bbox(벽 미검출→심볼
-                # 윤곽으로 대체)인 행을 "⚠벽미검출"로 표시해주지만, 그 정보가
-                # 여기 확정 검토표/세션 저장까지는 전달되지 않아 사용자가 나중에
-                # 세션 파일만 보고는 "이 승강로는 자동 크기가 아니라 직접
-                # 벽 치수를 확인해야 한다"는 걸 알 방법이 없었다(실제 벽 스냅에
-                # 실패한 승강로의 크기가 틀렸다는 사용자 피드백의 원인) — 코어
-                # 라벨에 ⚠ 표시를 남겨 검토표/엑셀/세션에 그대로 보이게 한다.
-                if r.get('source') == 'symbol_bbox':
-                    core_label += ' ⚠벽미검출'
-                    n_low_conf += 1
-                elif r.get('source') == 'ai_group_fix':
-                    core_label += ' ✎AI보정'  # 병렬 전용 AI 위치 보정 — 눈으로 대조 권장
-                self._add_detection_row(
-                    core=core_label, cap=r.get('capacity_guess'), layout=layout,
-                    w=r.get('width_mm'), d=r.get('depth_mm'))
-                n_added += 1
+        n_spec_bad = 0
+        # 코어 번호/A·B·C는 ③에서 _assign_core_labels로 이미 부여돼 있다 — ④ 도면
+        # 라벨, ③ 미리보기와 같은 값을 그대로 써서 번호가 어긋나지 않는다.
+        # 동 구분은 전체평면도 한 장만으로는 알 수 없어 비워둔다(직접 입력).
+        for r in sorted(self.parking_shaft_results, key=lambda r: r['index']):
+            layout = self.LAYOUT_OPTIONS[1] if r.get('is_parallel') else self.LAYOUT_OPTIONS[0]  # '병렬' / '단독'
+            # 자동 크기를 그대로 믿으면 안 되는 행(벽미검출/AI·주석 보정/도면 주석과 불일치)은
+            # 코어 라벨에 표시를 남겨 검토표/엑셀/세션에서도 보이게 한다.
+            core_label = r.get('core_label', f"코어{r['index']}") + _result_tag(r)
+            if r.get('source') == 'symbol_bbox':
+                n_low_conf += 1
+            if r.get('spec') and r.get('spec_ok') is False:
+                n_spec_bad += 1
+            self._add_detection_row(
+                core=core_label, cap=r.get('capacity_guess'), layout=layout,
+                w=r.get('width_mm'), d=r.get('depth_mm'))
+            n_added += 1
         msg = f'✅ ⑤ 확정 승강로 전체 검토표에 {n_added}건을 추가했습니다(동 구분은 직접 입력하세요).'
         if n_low_conf:
             msg += f' ⚠ {n_low_conf}건은 벽체 미검출(심볼 윤곽 크기)로 표시됨 — 도면에서 직접 확인 필요.'
-        self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS if not n_low_conf else ACCENT_WARNING)
+        if n_spec_bad:
+            msg += f' ⚠ {n_spec_bad}건은 도면의 W:xD: 주석 규격과 달라 표시됨 — 도면에서 확인 필요.'
+        self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS if not (n_low_conf or n_spec_bad) else ACCENT_WARNING)
         messagebox.showinfo('완료', msg)
 
     # ── 진행률 표시줄 ──────────────────────────────────
