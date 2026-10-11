@@ -225,6 +225,22 @@ def _wall_segment_candidates(msp, layer_hint='골조', max_block_depth=6):
     return segs
 
 
+# 벽 레이어별 벽선 후보 캐시 — 28MB급 도면은 레이어 하나를 모으는 데 약 20초가 걸리는데, ②(구성
+# 판정)와 ③(스냅)이 같은 레이어를 각자 다시 모으면 시간이 두 배로 든다. (파일경로, 수정시각, 레이어)
+# 기준으로 한 번만 모은다.
+_WALL_SEG_CACHE = {}
+
+
+def _cached_wall_segs(msp, dxf_path, layer):
+    try:
+        key = (dxf_path, os.path.getmtime(dxf_path), layer)
+    except Exception:
+        key = (dxf_path, 0, layer)
+    if key not in _WALL_SEG_CACHE:
+        _WALL_SEG_CACHE[key] = _wall_segment_candidates(msp, layer_hint=layer) if msp is not None else []
+    return _WALL_SEG_CACHE[key]
+
+
 def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
                              search_margin_ratio: float = 1.5, min_seg_len_mm: float = 300.0,
                              angle_tol_deg: float = 8.0, size_min_mm: float = 800.0,
@@ -2199,12 +2215,8 @@ class ElevatorShaftReviewModule:
         import ezdxf
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
-        segs_cache = {}
-
         def _segs_for(layer):
-            if layer not in segs_cache:
-                segs_cache[layer] = _wall_segment_candidates(msp, layer_hint=layer)
-            return segs_cache[layer]
+            return _cached_wall_segs(msp, dxf_path, layer)
 
         by_group = {}
         for i, c in enumerate(clusters):
@@ -2284,13 +2296,15 @@ class ElevatorShaftReviewModule:
         try:
             results = self._snap_parking_clusters_to_walls(
                 self.parking_source_path, self.parking_clusters, self.parking_wall_layers,
-                progress_cb=_progress, api=api)
+                progress_cb=_progress, api=api,
+                status_cb=lambda t: self.parent.after(0, lambda t=t: self.lbl_ai_status.config(text=t, fg=ACCENT_WARNING)))
         except Exception:
             traceback.print_exc()
             results = []
         self.parent.after(0, lambda: self._on_parking_step3_done(results))
 
-    def _snap_parking_clusters_to_walls(self, dxf_path, clusters, wall_layers, progress_cb=None, api=None):
+    def _snap_parking_clusters_to_walls(self, dxf_path, clusters, wall_layers, progress_cb=None, api=None,
+                                         status_cb=None):
         """①에서 찾은 심볼 위치(clusters)마다, ②에서 판별한 벽체 레이어(wall_layers)의
         벽선에 스냅을 시도한다. 벽 스냅이 실패하면(벽 레이어를 못 찾았거나 주변에
         벽선이 없음) 심볼 자체의 윤곽 bbox를 그대로 쓰고 source를 'symbol_bbox'로
@@ -2317,9 +2331,7 @@ class ElevatorShaftReviewModule:
             msp = None
 
         def _segs_for(layer_hint):
-            if layer_hint not in segs_cache:
-                segs_cache[layer_hint] = _wall_segment_candidates(msp, layer_hint=layer_hint) if msp else []
-            return segs_cache[layer_hint]
+            return _cached_wall_segs(msp, dxf_path, layer_hint)
 
         capacity_points = _collect_capacity_text_points(msp) if msp else []
         # 승강로끼리 가까이 붙어 있을 때(병렬/나란한 코어) 후보마다 독립적으로
@@ -2406,59 +2418,41 @@ class ElevatorShaftReviewModule:
                 'group_id': c.get('group_id', i - 1),
             })
 
-        # ── 병렬 그룹: 골조선만으로 N대 승강로 치수 따기 (텍스트 미사용) ──
-        # 그룹(병렬 코어)마다 칸별 감싸는 골조 사각형을 구하고, 공용 외곽이면 N등분/칸막이면
-        # 칸막이 면으로 나눈다(_snap_parallel_bays). 일반 스냅 결과보다 우선 적용한다.
-        if msp is not None:
-            by_group = {}
-            for pos, r in enumerate(results):
-                by_group.setdefault(r['group_id'], []).append(pos)
-            for gid, positions in by_group.items():
-                if len(positions) < 2:
-                    continue
-                members = [clusters[results[p]['index'] - 1] for p in positions]
-                # ②에서 단독/병렬·대수가 판정돼 있으면(group_id가 bay) 그 구성을 그대로 따른다
-                bay_of = [0] * len(members) if all(m.get('bay_checked') for m in members) else None
-                for wl in wall_layers:
-                    fixed = _snap_parallel_bays(_segs_for(wl), members, bay_of=bay_of)
-                    if len(fixed) != len(positions):
-                        continue        # 그룹 전체를 못 구하면 일부만 쓰지 않는다
-                    for k, p in enumerate(positions):
-                        f = fixed[k]
-                        results[p].update({
-                            'points': f['points'], 'width_mm': f['width_mm'], 'depth_mm': f['depth_mm'],
-                            'wall_layer_used': wl,
-                            'source': 'bay_shared' if f['shared'] else 'bay_snap',
-                            'bay_info': (f['bay_n'], f['bay_total'][0], f['bay_total'][1]),
-                        })
-                    break
-
-        # ── 병렬 그룹 전용 AI 위치 보정 ──
-        # 병렬 그룹에 벽 스냅 실패 칸이 하나라도 있으면, 그 그룹만 AI에게 칸별
-        # 안쪽 벽면을 고르게 하고(좌표 목록에서만 선택, 코드가 검증) 그룹 전체를
-        # 교체한다. 단독 승강로나 전부 정상 스냅된 병렬 그룹은 건드리지 않는다.
-        if api and api[0] and msp is not None:
-            by_group = {}
-            for pos, r in enumerate(results):
-                by_group.setdefault(r['group_id'], []).append(pos)
-            for gid, positions in by_group.items():
-                if len(positions) < 2:
-                    continue
-                if all(results[p]['source'] != 'symbol_bbox' for p in positions):
-                    continue
-                members = [clusters[results[p]['index'] - 1] for p in positions]
-                for wl in wall_layers:
-                    fixed = _ai_fix_parallel_group(_segs_for(wl), members, api[0], api[1], api[2])
-                    if not fixed:
-                        continue
-                    for k, p in enumerate(positions):
-                        results[p].update({
-                            'points': fixed[k]['points'],
-                            'width_mm': fixed[k]['width_mm'],
-                            'depth_mm': fixed[k]['depth_mm'],
-                            'wall_layer_used': wl, 'source': 'ai_group_fix',
-                        })
-                    break
+        # ── 병렬 그룹: 골조선만으로 N대 승강로 치수 따기 (텍스트·AI 미사용) ──
+        # 구성(단독/병렬, 대수)은 ②에서 이미 정해졌다. 그룹마다 bay 외곽 골조 사각형을 N대로 나눠
+        # 일반 스냅 결과보다 우선 적용한다. 벽 레이어는 앞쪽 후보 몇 개만 시도한다(레이어마다
+        # 도면 순회에 수십 초가 들어 전부 돌리면 멈춘 것처럼 보임). 이 후처리가 어떤 이유로
+        # 실패해도 위에서 구한 일반 스냅 결과는 그대로 남긴다.
+        try:
+            if msp is not None:
+                by_group = {}
+                for pos, r in enumerate(results):
+                    by_group.setdefault(r['group_id'], []).append(pos)
+                multi = [(gid, ps) for gid, ps in by_group.items() if len(ps) >= 2]
+                for gi, (gid, positions) in enumerate(multi, start=1):
+                    if status_cb:
+                        try:
+                            status_cb(f'③ 병렬 승강로 {gi}/{len(multi)}번째 그룹 골조선으로 치수 산출 중...')
+                        except Exception:
+                            pass
+                    members = [clusters[results[p]['index'] - 1] for p in positions]
+                    # ②에서 단독/병렬·대수가 판정돼 있으면(group_id가 bay) 그 구성을 그대로 따른다
+                    bay_of = [0] * len(members) if all(m.get('bay_checked') for m in members) else None
+                    for wl in wall_layers[:3]:
+                        fixed = _snap_parallel_bays(_segs_for(wl), members, bay_of=bay_of)
+                        if len(fixed) != len(positions):
+                            continue        # 그룹 전체를 못 구하면 일부만 쓰지 않는다
+                        for k, p in enumerate(positions):
+                            f = fixed[k]
+                            results[p].update({
+                                'points': f['points'], 'width_mm': f['width_mm'], 'depth_mm': f['depth_mm'],
+                                'wall_layer_used': wl,
+                                'source': 'bay_shared' if f['shared'] else 'bay_snap',
+                                'bay_info': (f['bay_n'], f['bay_total'][0], f['bay_total'][1]),
+                            })
+                        break
+        except Exception:
+            traceback.print_exc()
 
         # 미리보기·④·⑤가 같은 코어 번호를 쓰도록 라벨을 한 번에 부여한다.
         for idx, (label, parallel) in _assign_core_labels(results).items():
