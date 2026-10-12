@@ -284,6 +284,21 @@ _STRUCT_EXCLUDE_TOKENS = ('CEN', 'GRID', '중심선', '그리드', 'CONTINUOUS',
                           'ELEV', '승강', 'LIFT')
 
 
+def _layer_priority(name):
+    """벽 레이어 우선순위(작을수록 먼저 시도): 0=콘크리트/골조(CON·CONC·골조), 1=벽체(WAL·WALL·벽체),
+    2=그 밖. 한 도면에서도 승강로 위치에 따라 골조 레이어가 다를 수 있어(실측: 주민공동시설 쪽은 A_CON,
+    세대 쪽은 0-상부 벽체) 전역 1위 하나 대신, 승강로마다 이 순서로 시도해 주변에 실제로 감싸는 선이
+    있는 첫 레이어를 쓴다."""
+    last = (name or '').split('$')[-1]
+    up = last.upper()
+    toks = [t for t in re.split(r'[^A-Z0-9가-힣]+', up) if t]
+    if '골조' in last or any((t.endswith('CON') and t != 'CONTINUOUS') or t.startswith('CONC') for t in toks):
+        return 0
+    if '벽체' in last or any('WAL' in t for t in toks):
+        return 1
+    return 2
+
+
 def _structural_layer_names(stats):
     """레이어명에 벽/구조체 단서가 있는 후보(AI가 놓쳤을 수 있는 G-CON 같은 이름까지 후보 풀에 넣는다).
     최종 선택은 이름이 아니라 아래 기하 점수(_rank_wall_layers)가 한다."""
@@ -766,12 +781,86 @@ def _snap_bbox_to_wall_segs_any_angle(segs, guess_bbox_world, layer_hint: str = 
 #  후보로 인정한다. AI 이미지 판독 없이 벡터 좌표로 직접 찾으므로 빠르고
 #  정확하며, 전체를 렌더링/분석할 필요 없이 그 좌표 주변만 잘라 쓸 수 있다.
 # ──────────────────────────────────────────────────────────────
+def _x_candidates(segs, min_len: float, min_cross_deg: float = 30.0):
+    """중점에서 서로 교차하는 같은 길이의 두 선(= X자) 후보 목록. 각 항목: (길이, 중심, 선a, 선b)."""
+    long_ = [(s_, math.hypot(s_[2] - s_[0], s_[3] - s_[1])) for s_ in segs]
+    long_ = [(s_, ln) for s_, ln in long_ if ln >= min_len]
+    out = []
+    for i in range(len(long_)):
+        a, la = long_[i]
+        ma = ((a[0] + a[2]) / 2, (a[1] + a[3]) / 2)
+        for j in range(i + 1, len(long_)):
+            b, lb = long_[j]
+            if abs(la - lb) > 0.05 * max(la, lb):
+                continue
+            mb = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+            if math.hypot(ma[0] - mb[0], ma[1] - mb[1]) > 80.0:
+                continue
+            d = abs(math.degrees(math.atan2(a[3] - a[1], a[2] - a[0]) - math.atan2(b[3] - b[1], b[2] - b[0]))) % 180
+            if min_cross_deg <= d <= 180.0 - min_cross_deg:
+                out.append((la, ma, a, b))
+    return out
+
+
+def _x_rect_of(cand):
+    _l, ctr, a, b = cand
+    corners = [(a[0], a[1]), (b[0], b[1]), (a[2], a[3]), (b[2], b[3])]
+    ang = math.degrees(math.atan2(corners[1][1] - corners[0][1], corners[1][0] - corners[0][0])) % 90.0
+    loc = [_rotate_point(x, y, -ang, ctr) for x, y in corners]
+    w = max(p[0] for p in loc) - min(p[0] for p in loc)
+    h = max(p[1] for p in loc) - min(p[1] for p in loc)
+    return {'center': ctr, 'corners': corners, 'angle': ang, 'width': w, 'height': h}
+
+
+def _x_symbol_rect(segs, min_len: float = 1500.0):
+    """승강기 심볼의 X자 대각선(서로 중점에서 교차하는 같은 길이의 두 선)으로 차실 사각형을 정확히 구한다.
+    사다리·문틀 같은 이웃 형상이 같은 클러스터에 섞여 있어도 심볼 윤곽 bbox와 각도를 흔들리지 않게 한다.
+    여러 X가 있으면 가장 큰 것을 쓴다. 반환: {'center','corners'(월드 4점),'angle'(0~90),'width','height'} 또는 None."""
+    cands = _x_candidates(segs, min_len)
+    if not cands:
+        return None
+    return _x_rect_of(max(cands, key=lambda c: c[0]))
+
+
+def _door_from_narrow_x(segs, main_ctr, angle_deg, main_len: float):
+    """차실 X 옆에 붙은 '좁고 긴 X'(문: 폭 약 200mm, 길이 약 1400mm — 실측 세대 심볼)가 있으면 그쪽을
+    문 방향으로 본다. 반환: 월드 단위벡터 또는 None."""
+    best = None
+    for cand in _x_candidates(segs, 400.0, min_cross_deg=8.0):
+        if cand[0] >= main_len * 0.8:
+            continue                      # 차실 X 자신은 제외
+        r = _x_rect_of(cand)
+        lo, hi = sorted((r['width'], r['height']))
+        if lo <= 0 or hi / lo < 2.5:
+            continue                      # 좁고 긴 것만
+        ox, oy = _rotate_point(r['center'][0], r['center'][1], -angle_deg, main_ctr)
+        ox, oy = ox - main_ctr[0], oy - main_ctr[1]
+        dist = math.hypot(ox, oy)
+        if dist < 300.0:
+            continue
+        if best is None or dist > best[0]:
+            best = (dist, ox, oy)
+    if not best:
+        return None
+    _d, ox, oy = best
+    u = (1.0 if ox > 0 else -1.0, 0.0) if abs(ox) >= abs(oy) else (0.0, 1.0 if oy > 0 else -1.0)
+    rad = math.radians(angle_deg)
+    return (u[0] * math.cos(rad) - u[1] * math.sin(rad), u[0] * math.sin(rad) + u[1] * math.cos(rad))
+
+
 def _door_direction(member_segs, center, angle_deg, min_asym: float = 60.0):
     """승강기 심볼의 문(승강장) 방향을 기하로 읽는다 — 월드 좌표의 단위벡터 (dx, dy), 못 읽으면 None.
     심볼의 문은 차실 사각형 바깥 한쪽에 붙은 짧은 선(실측: 중심에서 ±963mm, 길이 1400mm)이고, 차실
     윤곽선(±806~935)과 십자선(중심 통과)은 그보다 안쪽이다. 그래서 심볼 선분을 심볼 축 기준 로컬
     좌표로 돌려, 축에 평행한 선분 중 중심에서 가장 멀리 떨어진 선의 방향을 문 쪽으로 본다. 반대편
     최대 거리와의 차이가 min_asym 미만이면(좌우 대칭이라 문을 구별할 수 없음) None."""
+    xr_main = _x_symbol_rect(member_segs)
+    if xr_main:
+        main_len = max((math.hypot(c_[2][2] - c_[2][0], c_[2][3] - c_[2][1]) for c_ in _x_candidates(member_segs, 1500.0)),
+                       default=0.0)
+        narrow = _door_from_narrow_x(member_segs, xr_main['center'], xr_main['angle'], main_len)
+        if narrow:
+            return narrow
     best = {'+x': 0.0, '-x': 0.0, '+y': 0.0, '-y': 0.0}
     for x0, y0, x1, y1 in member_segs:
         p0 = _rotate_point(x0, y0, -angle_deg, center)
@@ -810,6 +899,19 @@ def _same_door(c1, c2, min_dot: float = 0.9):
     if not d1 or not d2:
         return True
     return d1[0] * d2[0] + d1[1] * d2[1] >= min_dot
+
+
+# 줄여 쓴 승강기 레이어명('A-el', 'A-EV', 'E-ELV' 등)을 위한 토큰 규칙 — 레이어명을 '-', '_', '$', 공백 등으로
+# 쪼갠 토큰 하나가 정확히 아래 값이거나 'ELEV'로 시작하면 승강기 레이어로 본다. 부분일치가 아니라
+# 토큰 일치라서 'LEVEL'/'REVISION'/'DEVELOP' 같은 무관한 이름에는 걸리지 않는다.
+_ELEV_TOKENS = {'EL', 'EV', 'ELV', 'LIFT', 'ELEVATOR', 'ELEVATORS', 'EVT', 'E.V'}
+
+
+def _has_elev_token(layer_name):
+    for tok in re.split(r'[^A-Za-z0-9가-힣.]+', (layer_name or '').upper()):
+        if tok in _ELEV_TOKENS or tok.startswith('ELEV') or tok.startswith('승강'):
+            return True
+    return False
 
 
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
@@ -859,7 +961,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
         if layer_name in hidden:
             return False
         up = (layer_name or '').upper()
-        return any(k in up for k in kws)
+        return any(k in up for k in kws) or _has_elev_token(layer_name)
 
     def _entity_points(e):
         t = e.dxftype()
@@ -1013,13 +1115,29 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                 'width_mm': rw, 'height_mm': rh,
             }
 
+        # 심볼의 X자 대각선이 있으면 그것으로 차실 사각형/각도/중심을 정확히 잡는다(이웃 형상이 섞인
+        # 클러스터에서도 흔들리지 않음). 문 방향은 그 사각형 주변 선분만으로 읽는다.
+        xr = _x_symbol_rect(member_segs)
+        door_segs, door_ctr = member_segs, center
+        if xr:
+            rotated_rect = {'angle': xr['angle'], 'points': xr['corners'],
+                            'width_mm': xr['width'], 'height_mm': xr['height']}
+            door_ctr = xr['center']
+            rx, ry = xr['width'] * 0.75, xr['height'] * 0.75
+            door_segs = []
+            for sg in member_segs:
+                mx_, my_ = (sg[0] + sg[2]) / 2, (sg[1] + sg[3]) / 2
+                lx, ly = _rotate_point(mx_, my_, -xr['angle'], door_ctr)
+                if abs(lx - door_ctr[0]) <= rx and abs(ly - door_ctr[1]) <= ry:
+                    door_segs.append(sg)
         clusters.append({
             'center': center,
             'bbox': (x0, y0, x1, y1),
             'n_entities': len(idxs),
             'layers': sorted({found[i][8] for i in idxs}),
             'rotated_rect': rotated_rect,
-            'door': _door_direction(member_segs, center, rotated_rect['angle']),
+            'door': _door_direction(door_segs, door_ctr, rotated_rect['angle']),
+            'x_center': xr['center'] if xr else None,
         })
         cluster_idxs_list.append(idxs)
 
@@ -1094,6 +1212,13 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
         if root not in group_id_map:
             group_id_map[root] = len(group_id_map)
         clusters[ci]['group_id'] = group_id_map[root]
+
+    # 그룹 판정이 끝났으니, X자 대각선을 찾은 클러스터는 중심/bbox를 X 사각형 기준으로 바로잡는다.
+    for c in clusters:
+        if c.get('x_center'):
+            pts_ = c['rotated_rect']['points']
+            c['center'] = c['x_center']
+            c['bbox'] = (min(p[0] for p in pts_), min(p[1] for p in pts_), max(p[0] for p in pts_), max(p[1] for p in pts_))
 
     # 유령 심볼 제거 — 블록 배치 오류/거울상 복사 등으로 도면 본체에서 수백 m 이상 떨어진 곳(실측:
     # 다른 심볼들과 44km 떨어진 x좌표 거울상)에 같은 모양이 생기는 경우가 있다. 최근접 이웃이
@@ -1531,7 +1656,8 @@ def _ai_fix_parallel_group(segs, members, api_key, model, provider, max_lines=70
 #      칸 사이마다 칸막이 골조선이 있으면 그 면으로, 없으면 이웃 중심의 중간선으로
 #      자른다. 바깥 경계는 bay 외곽 E를 쓴다.
 # ──────────────────────────────────────────────────────────────
-def _enclosure_local(verticals, horizontals, gb, min_cover: float = 0.35, slack=None, want_info: bool = False):
+def _enclosure_local(verticals, horizontals, gb, min_cover: float = 0.35, slack=None, want_info: bool = False,
+                      max_out: float = 1000.0):
     """로컬 좌표의 심볼 윤곽 gb=(x0,y0,x1,y1) 바깥에서, 네 방향으로 가장 가까운 벽선
     (그 변 방향 심볼 폭의 min_cover 이상을 덮는 선)을 골라 (L, R, B, T)로 돌려준다.
     문 개구부로 벽이 끊겨도 합집합 커버리지로 판단한다.
@@ -1554,7 +1680,12 @@ def _enclosure_local(verticals, horizontals, gb, min_cover: float = 0.35, slack=
     def _pick(lines, lo, hi, edge, side, slack):
         best = None
         for ln in lines:
-            ok = (ln['pos'] <= edge + slack) if side == 'low' else (ln['pos'] >= edge - slack)
+            # 승강로 안쪽 벽면은 심볼 가장자리에서 max_out(기본 1m) 이내에 있다 — 그보다 먼 선은 이 승강로의
+            # 벽이 아니라 건물 외곽 등 다른 선이므로, 없는 변으로 보고(문 쪽 추정으로 넘김) 잡지 않는다.
+            if side == 'low':
+                ok = (edge - max_out <= ln['pos'] <= edge + slack)
+            else:
+                ok = (edge - slack <= ln['pos'] <= edge + max_out)
             if not ok or _line_coverage(ln, lo, hi) < min_cover:
                 continue
             if best is None or (side == 'low' and ln['pos'] > best['pos']) or \
@@ -1687,10 +1818,15 @@ def _group_local_frame(segs, members, max_size_mm: float = 6500.0):
 
 
 def _bays_by_containment(frame):
-    """규칙 기반 bay 판정(AI 없이): 칸별로 감싸는 골조 사각형을 구해, 한 칸의 외곽이 다른 칸
-    중심을 포함하면(= 공용 승강로) 같은 bay로 묶는다. 반환: [bay_id per member]"""
+    """규칙 기반 bay 판정(AI 없이). 1) 칸별로 감싸는 골조 사각형을 구해, 한 칸의 외곽이 다른 칸 중심을
+    포함하면(= 공용 승강로) 같은 bay로 묶는다. 2) 그래도 자기 외곽을 못 구한 칸(공용 승강로에서 칸
+    하나씩으로는 벽 커버리지가 모자란 경우 — 실측: 두 대가 한 벽 안에 있는 세대 코어)은 가장 가까운
+    칸부터 합쳐 보고, 합친 외곽이 생기고 그 안에 다른 bay의 칸이 없으면 한 bay로 묶는다.
+    반환: [bay_id per member]"""
     n = len(frame['centers'])
-    encl = [_enclosure_local(frame['verticals'], frame['horizontals'], g) for g in frame['guesses']]
+    centers, guesses = frame['centers'], frame['guesses']
+    V, H = frame['verticals'], frame['horizontals']
+    encl = [_enclosure_local(V, H, g) for g in guesses]
     parent = list(range(n))
 
     def _find(x):
@@ -1704,11 +1840,52 @@ def _bays_by_containment(frame):
             continue
         L, R, B, T = encl[i]
         for j in range(n):
-            cx, cy = frame['centers'][j]
+            cx, cy = centers[j]
             if i != j and L <= cx <= R and B <= cy <= T:
                 parent[_find(i)] = _find(j)
-    roots = {}
-    return [roots.setdefault(_find(i), len(roots)) for i in range(n)]
+    comps = {}
+    for i in range(n):
+        comps.setdefault(_find(i), []).append(i)
+    comps = {k: v for k, v in enumerate(comps.values())}
+
+    def _rect(idxs):
+        union = (min(guesses[i][0] for i in idxs), min(guesses[i][1] for i in idxs),
+                 max(guesses[i][2] for i in idxs), max(guesses[i][3] for i in idxs))
+        return _enclosure_local(V, H, union, slack=_cell_slack(guesses, idxs))
+
+    def _valid(idxs):
+        r = _rect(idxs)
+        if not r:
+            return False
+        L, R, B, T = r
+        inside = [j for j in range(n) if L <= centers[j][0] <= R and B <= centers[j][1] <= T]
+        return set(inside) == set(idxs)
+
+    def _centroid(idxs):
+        return (sum(centers[i][0] for i in idxs) / len(idxs), sum(centers[i][1] for i in idxs) / len(idxs))
+
+    changed = True
+    while changed:
+        changed = False
+        for bid in list(comps):
+            if _valid(comps[bid]):
+                continue
+            c0 = _centroid(comps[bid])
+            others = sorted((b for b in comps if b != bid),
+                            key=lambda b: math.hypot(_centroid(comps[b])[0] - c0[0], _centroid(comps[b])[1] - c0[1]))
+            for ob in others:
+                if _valid(comps[bid] + comps[ob]):
+                    comps[bid] = comps[bid] + comps[ob]
+                    del comps[ob]
+                    changed = True
+                    break
+            if changed:
+                break
+    out = [0] * n
+    for bid, idxs in comps.items():
+        for i in idxs:
+            out[i] = bid
+    return out
 
 
 BAY_AI_PROMPT = """당신은 건축 평면도에서 승강기(엘리베이터) 배치 구조를 판별하는 보조원입니다.
@@ -1865,9 +2042,6 @@ def _result_tag(r):
            'bay_shared': ''}.get(r.get('source'), ' ⚠벽미검출')
     if r.get('open_side'):
         tag += ' ⚠문쪽 벽선 없음→추정'
-    used, primary = r.get('wall_layer_used'), r.get('primary_layer')
-    if used and primary and used != primary:
-        tag += f" ⚠보조레이어({_pretty_layer(used)})"
     if r.get('source') == 'bay_shared' and r.get('bay_info'):
         n, tw, td = r['bay_info']
         tag += f" ✎공용승강로{n}대(골조내측 {tw:.0f}x{td:.0f})"
@@ -2490,11 +2664,13 @@ class ElevatorShaftReviewModule:
                 # 한 도면에서 승강로 골조 레이어는 하나다(동/블록과 무관). 승강로 둘레 인식 점수 1위
                 # 레이어 하나만 쓴다 — 여러 레이어를 합치거나 돌아가며 시도하면 기준선 같은 엉뚱한
                 # 선에 스냅될 수 있다. 화면에서 동결/꺼진 레이어는 후보에서 이미 제외돼 있다.
-                # 단, 기본 레이어에 벽이 하나도 없는 승강로(실측: E.V/계단실 쪽 승강로 4곳은 벽이 G-CON이
-                # 아니라 CON에 그려져 있음)를 위해 점수 순으로 보조 레이어 최대 2개를 뒤에 붙인다.
-                # ③은 기본 레이어에서 벽을 못 찾은 승강로에만 보조 레이어를 쓰고, 그 결과에는 표시를 남긴다.
-                wall_layers = [ranked[0][0]] + [l for l, _sc, _cv in ranked[1:3]]
-                info['covered'] = len(ranked[0][2])
+                # 점수가 1 이상인(승강로 둘레를 실제로 감싼 적 있는) 레이어를 모두 후보로 두고, 우선순위
+                # (골조/CON → 벽체 → 그 밖)와 점수 순으로 정렬한다. ③은 승강로마다 이 순서로 시도해 그 승강로를
+                # 실제로 감싸는 첫 레이어를 쓴다(레이어를 합치지 않는다).
+                cand_layers = [(l, sc) for l, sc, _cv in ranked if sc >= 1][:5]
+                cand_layers.sort(key=lambda t: (_layer_priority(t[0]), -t[1]))
+                wall_layers = [l for l, _sc in cand_layers]
+                info['covered'] = len(set().union(*[cv for _l, _sc, cv in ranked if _l in wall_layers])) if wall_layers else 0
             else:
                 wall_layers = list(info['ai_layers'])
         except Exception as e:
@@ -2533,6 +2709,7 @@ class ElevatorShaftReviewModule:
             members = [clusters[i] for i in idxs]
             bay_of = None
             if len(idxs) >= 2:
+                first = None
                 for wl in wall_layers:
                     segs = _segs_for(wl)
                     if not segs:
@@ -2541,13 +2718,21 @@ class ElevatorShaftReviewModule:
                     if not frame:
                         continue
                     cand = _ai_classify_bays(segs, members, *api) if api and api[0] else None
-                    if cand is not None and _bays_plausible(frame, cand):
-                        bay_of = cand
+                    used_ai = cand is not None and _bays_plausible(frame, cand)
+                    if not used_ai:
+                        cand = _bays_by_containment(frame)
+                    ok = len(_snap_parallel_bays(segs, members, bay_of=cand)) == len(members)
+                    if first is None:
+                        first = (cand, used_ai)
+                    if ok:               # 그룹 전체가 실제로 감싸지는 첫 레이어의 판정을 쓴다
+                        first = (cand, used_ai)
+                        break
+                if first is not None:
+                    bay_of = first[0]
+                    if first[1]:
                         n_ai += 1
                     else:
-                        bay_of = _bays_by_containment(frame)
                         n_rule += 1
-                    break
             else:
                 bay_of = [0]
             checked = bay_of is not None
@@ -2574,11 +2759,11 @@ class ElevatorShaftReviewModule:
         self.btn_step3.config(state='normal')
         info = info or {}
         if wall_layers:
-            used = _pretty_layer(wall_layers[0]) if wall_layers else ''
+            used = ' → '.join(_pretty_layer(l) for l in wall_layers)
             sc = info.get('scores') or []
             n = len(self.parking_clusters or []) or 1
             score_txt = ', '.join(f"{_pretty_layer(l)} {s_}/{n}곳" for l, s_ in sc[:5])
-            msg = f"✅ ② 사용할 벽체(골조) 레이어: {used}"
+            msg = f"✅ ② 벽체(골조) 레이어(우선순위 순, 승강로마다 첫 일치): {used}"
             if score_txt:
                 msg += f"  [승강로 둘레 인식 점수: {score_txt}; 선택 레이어가 둘러싼 승강로 {info.get('covered', 0)}/{n}곳]"
             ai = info.get('ai_layers') or []
