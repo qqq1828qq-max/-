@@ -1,33 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-조규수님의 승강기 검토 (Elevator Shaft Review)
-────────────────────────────────────────────────────────
-독립 실행 프로그램입니다. electrical_design_hub.py의 "탭"이 아니라
-그 자체로 완결된 프로그램이며, UI 셸(좌측 사이드바 + 상단바 + 카드
-스타일)은 기존 Design Hub와 동일한 스타일을 유지하되, 이 프로그램에
-필요 없는 다른 설계 탭들(AI 자동화, SLD, 접지, 부하계산, 분전반,
-저압반/고압반, 전선관, 케이블트레이, DXF 비교/병합, PDF변환, 성과물
-출력, AI 어시스턴트 등)은 전부 제거했습니다.
-
-남은 탭은 단 2개입니다:
-    00. API 설정          — NVIDIA NIM / Google Gemini 키·모델 관리
-    01. 승강로 CAD 도면 분석   — 평면도/입면도 실측 치수 vs 제조사별(미쓰비시/OTIS/TK/현대) 기준 자동 판정
-                           (법적 규격/인승산정 등은 이후 02단계~ 탭에서 다룰 예정)
-
-실행:
-    python elevator_review_app.py
-
-같은 폴더에 다음 파일들이 있어야 합니다:
-    designhub_ui_theme.py, ai_client.py, api_settings_module.py,
-    elevator_standards.py, elevator_shaft_table.json,
-    elevator_shaft_review_module.py
-"""
+"""승강기 검토"""
 
 import tkinter as tk
 from tkinter import messagebox
 import os
-import platform
+import elevator_security as _sec
 
 from designhub_ui_theme import (
     SIDEBAR_BG, SIDEBAR_HOVER, SIDEBAR_ACTIVE,
@@ -42,51 +20,19 @@ from designhub_ui_theme import (
 )
 
 # ══════════════════════════════════════════════════════════════
-#  접근 제어 — 기존 Mr.Q 프로그램군과 동일한 컴퓨터 이름 기반 방식.
-#  필요 없으면 __init__()의 _check_access() 호출부만 지우면 됩니다.
-# ══════════════════════════════════════════════════════════════
-ALLOWED_BASE_NAMES = [
-    "P161808N",
-    "P162872N",
-    "P149710N",
-    "P152356N",
-    "P162858N",
-    "P157901N",
-    "P162846N",
-    "P162264N",
-    "P162646N",
-]
-
-
-def _generate_allowed_names():
-    allowed_names = set()
-    for base_name in ALLOWED_BASE_NAMES:
-        allowed_names.add(base_name.upper())
-        for k in range(1, 100):
-            allowed_names.add(f"{base_name}{k:02d}".upper())
-    return allowed_names
-
-
-def _check_access():
-    current_computer_name = platform.node().upper()
-    allowed_names = _generate_allowed_names()
-    return current_computer_name in allowed_names
-
-
-# ══════════════════════════════════════════════════════════════
 #  메인 애플리케이션
 # ══════════════════════════════════════════════════════════════
 class ElevatorReviewApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        if not _check_access():
-            messagebox.showerror(
-                "접근 거부",
-                f"🚫 접근이 허용되지 않은 컴퓨터입니다.\n\n현재 컴퓨터 이름: {platform.node().upper()}"
-            )
+        _ok, _pc = _sec.check_access()
+        if not _ok:
+            messagebox.showerror("접근 거부", f"접근이 허용되지 않은 컴퓨터입니다.\n\nPC: {_pc}")
             self.destroy()
             return
+        self.bind_all('<Control-Shift-G>', lambda _e: _sec.open_user_manager(self))
+        self.bind_all('<Control-Shift-g>', lambda _e: _sec.open_user_manager(self))
 
         # 윈도우 설정
         self.title("조규수님의 승강기 검토")
@@ -115,15 +61,6 @@ class ElevatorReviewApp(tk.Tk):
             pass
 
         self._build_ui()
-
-        messagebox.showinfo(
-            "조규수님의 승강기 검토",
-            "환영합니다.\n\n"
-            "【시작 순서】\n"
-            "① 사이드바 00 API 설정 탭에서 프로바이더 선택 후 API 키 입력·저장\n"
-            "② 01 승강로 CAD 도면 분석 탭에서 평면도/입면도 DXF를 불러와 검토를 진행하세요\n\n"
-            "API 키는 한 번 저장하면 다음 실행 시 자동 로드됩니다."
-        )
 
     # ──────────────────────────────────────────────────────────
     #  UI 헬퍼 (Design Hub와 동일한 스타일 유지)
