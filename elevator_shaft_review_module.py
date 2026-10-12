@@ -767,7 +767,7 @@ def _snap_bbox_to_wall_segs_any_angle(segs, guess_bbox_world, layer_hint: str = 
 #  정확하며, 전체를 렌더링/분석할 필요 없이 그 좌표 주변만 잘라 쓸 수 있다.
 # ──────────────────────────────────────────────────────────────
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
-                                 size_min_mm: float = 700.0, size_max_mm: float = 7000.0,
+                                 size_min_mm: float = 1300.0, size_max_mm: float = 7000.0,
                                  cluster_dist_mm: float = 4000.0, merge_bbox_cap_mm: float = 4500.0,
                                  max_block_depth: int = 6):
     """dxf_path 전체(모델스페이스 + 중첩 블록)에서 레이어명에 layer_keywords 중
@@ -1044,6 +1044,18 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             group_id_map[root] = len(group_id_map)
         clusters[ci]['group_id'] = group_id_map[root]
 
+    # 유령 심볼 제거 — 블록 배치 오류/거울상 복사 등으로 도면 본체에서 수백 m 이상 떨어진 곳(실측:
+    # 다른 심볼들과 44km 떨어진 x좌표 거울상)에 같은 모양이 생기는 경우가 있다. 최근접 이웃이
+    # OUTLIER_DIST_MM보다 먼 외톨이는, 다른 심볼이 3개 이상 있을 때만 승강로 후보에서 뺀다.
+    OUTLIER_DIST_MM = 500000.0
+    if len(clusters) >= 4:
+        keep = []
+        for i, c in enumerate(clusters):
+            nn = min(math.hypot(c['center'][0] - o['center'][0], c['center'][1] - o['center'][1])
+                     for j, o in enumerate(clusters) if j != i)
+            if nn <= OUTLIER_DIST_MM:
+                keep.append(c)
+        clusters = keep
     clusters.sort(key=lambda c: c['center'][0])
     return clusters
 
@@ -1468,15 +1480,20 @@ def _ai_fix_parallel_group(segs, members, api_key, model, provider, max_lines=70
 #      칸 사이마다 칸막이 골조선이 있으면 그 면으로, 없으면 이웃 중심의 중간선으로
 #      자른다. 바깥 경계는 bay 외곽 E를 쓴다.
 # ──────────────────────────────────────────────────────────────
-def _enclosure_local(verticals, horizontals, gb, min_cover: float = 0.35, slack=None):
+def _enclosure_local(verticals, horizontals, gb, min_cover: float = 0.35, slack=None, want_info: bool = False):
     """로컬 좌표의 심볼 윤곽 gb=(x0,y0,x1,y1) 바깥에서, 네 방향으로 가장 가까운 벽선
     (그 변 방향 심볼 폭의 min_cover 이상을 덮는 선)을 골라 (L, R, B, T)로 돌려준다.
-    문 개구부로 벽이 끊겨도 합집합 커버리지로 판단한다. 한 방향이라도 없으면 None.
+    문 개구부로 벽이 끊겨도 합집합 커버리지로 판단한다.
 
     심볼 윤곽은 실제 벽 안쪽 면보다 안/밖으로 어긋나 그려지는 경우가 많다(실측: 심볼이 벽 안쪽
     면을 약 150mm 파고듦 — 허용치 150mm로는 안쪽 면을 놓치고 이중선의 바깥 줄을 잡아 폭이 250mm
     커졌다). 그래서 심볼 가장자리에서 '안쪽으로 slack'까지 들어온 선도 후보로 인정한다.
-    slack=(sx, sy)를 안 주면 심볼 폭/높이의 25%(최소 150mm)."""
+    slack=(sx, sy)를 안 주면 심볼 폭/높이의 25%(최소 150mm).
+
+    문(승강장) 쪽 한 변은 벽선이 아예 없는 도면이 흔하다(실측: 그 변의 위/아래 벽이 문 개구부 앞에서
+    끝나고 마주 보는 변은 다른 레이어/없음). 정확히 한 변만 없고 나머지 세 변이 확실하면, 그 변과
+    직교하는 두 벽선이 끝나는 위치(둘이 250mm 이내로 일치할 때)를 빠진 변으로 추정한다.
+    want_info=True면 ((L,R,B,T), 추정한 변 'L'/'R'/'B'/'T' 또는 None)을 돌려준다. 못 구하면 None."""
     x0, y0, x1, y1 = gb
     if slack is None:
         sx, sy = max(150.0, 0.25 * (x1 - x0)), max(150.0, 0.25 * (y1 - y0))
@@ -1494,13 +1511,39 @@ def _enclosure_local(verticals, horizontals, gb, min_cover: float = 0.35, slack=
                 best = ln
         return best
 
-    left = _pick(verticals, y0, y1, x0, 'low', sx)
-    right = _pick(verticals, y0, y1, x1, 'high', sx)
-    bottom = _pick(horizontals, x0, x1, y0, 'low', sy)
-    top = _pick(horizontals, x0, x1, y1, 'high', sy)
-    if not (left and right and bottom and top):
+    picks = {
+        'L': _pick(verticals, y0, y1, x0, 'low', sx),
+        'R': _pick(verticals, y0, y1, x1, 'high', sx),
+        'B': _pick(horizontals, x0, x1, y0, 'low', sy),
+        'T': _pick(horizontals, x0, x1, y1, 'high', sy),
+    }
+    pos = {k: (v['pos'] if v else None) for k, v in picks.items()}
+    inferred = None
+    missing = [k for k, v in picks.items() if v is None]
+    if len(missing) == 1:
+        k = missing[0]
+        perp = [picks['B'], picks['T']] if k in ('L', 'R') else [picks['L'], picks['R']]
+        lo_s, hi_s = (x0, x1) if k in ('L', 'R') else (y0, y1)
+        if all(perp):
+            ends = []
+            for ln in perp:
+                sp = [(a, b) for a, b in ln['spans'] if b > lo_s and a < hi_s]
+                if not sp:
+                    break
+                ends.append(max(b for _a, b in sp) if k in ('R', 'T') else min(a for a, _b in sp))
+            if len(ends) == 2 and abs(ends[0] - ends[1]) <= 250.0:
+                v = (ends[0] + ends[1]) / 2.0
+                edge = {'L': x0, 'R': x1, 'B': y0, 'T': y1}[k]
+                sl = sx if k in ('L', 'R') else sy
+                ok = (v >= edge - sl and v <= edge + 2000.0) if k in ('R', 'T') else \
+                     (v <= edge + sl and v >= edge - 2000.0)
+                if ok:
+                    pos[k] = v
+                    inferred = k
+    if any(v is None for v in pos.values()):
         return None
-    return left['pos'], right['pos'], bottom['pos'], top['pos']
+    rect = (pos['L'], pos['R'], pos['B'], pos['T'])
+    return (rect, inferred) if want_info else rect
 
 
 def _split_axis(centers, lo, hi, lines, cross_lo, cross_hi, tol: float = 700.0,
@@ -1714,10 +1757,10 @@ def _snap_parallel_bays(segs, members, bay_of=None, min_size_mm: float = 1200.0,
         # bay 전체 심볼 윤곽(합집합) 바깥의 가장 가까운 골조선 = bay 외곽
         union = (min(guesses[i][0] for i in idxs), min(guesses[i][1] for i in idxs),
                  max(guesses[i][2] for i in idxs), max(guesses[i][3] for i in idxs))
-        encl = _enclosure_local(verticals, horizontals, union, slack=_cell_slack(guesses, idxs))
-        if not encl:
+        got = _enclosure_local(verticals, horizontals, union, slack=_cell_slack(guesses, idxs), want_info=True)
+        if not got:
             continue
-        L, R, B, T = encl
+        (L, R, B, T), open_side = got
         if not all(L <= centers[i][0] <= R and B <= centers[i][1] <= T for i in idxs):
             continue
         rects, shared = {}, False
@@ -1740,7 +1783,8 @@ def _snap_parallel_bays(segs, members, bay_of=None, min_size_mm: float = 1200.0,
             corners = [(rl, rb), (rr_, rb), (rr_, rt), (rl, rt)]
             world = [_rotate_point(gcx + x, gcy + y, angle, (gcx, gcy)) for x, y in corners]
             out[i] = {'points': world, 'width_mm': round(rr_ - rl, 1), 'depth_mm': round(rt - rb, 1),
-                      'shared': shared, 'bay_n': len(idxs), 'bay_total': (round(R - L, 1), round(T - B, 1))}
+                      'shared': shared, 'bay_n': len(idxs), 'bay_total': (round(R - L, 1), round(T - B, 1)),
+                      'open_side': open_side}
     return out
 
 
@@ -1768,6 +1812,8 @@ def _result_tag(r):
     """③ 결과 한 건의 신뢰도/구조 표시(미리보기·④ 도면 라벨·⑤ 검토표 공용)."""
     tag = {'wall_snap': '', 'ai_group_fix': ' ✎AI보정', 'bay_snap': '',
            'bay_shared': ''}.get(r.get('source'), ' ⚠벽미검출')
+    if r.get('open_side'):
+        tag += ' ⚠문쪽 벽선 없음→추정'
     used, primary = r.get('wall_layer_used'), r.get('primary_layer')
     if used and primary and used != primary:
         tag += f" ⚠보조레이어({_pretty_layer(used)})"
@@ -2678,7 +2724,20 @@ class ElevatorShaftReviewModule:
                                 'wall_layer_used': wl,
                                 'source': 'bay_shared' if f['shared'] else 'bay_snap',
                                 'bay_info': (f['bay_n'], f['bay_total'][0], f['bay_total'][1]),
+                                'open_side': f.get('open_side'),
                             })
+                        break
+                # 일반 스냅(4면 필요)이 실패한 단독 승강로 — 문 쪽 한 변이 비어 있는 경우를 위해
+                # bay 방식(3면 + 한 변 추정)으로 한 번 더 시도한다.
+                for r in results:
+                    if r['source'] != 'symbol_bbox':
+                        continue
+                    for wl in wall_layers[:3]:
+                        f = _snap_parallel_bays(_segs_for(wl), [clusters[r['index'] - 1]], bay_of=[0]).get(0)
+                        if not f:
+                            continue
+                        r.update({'points': f['points'], 'width_mm': f['width_mm'], 'depth_mm': f['depth_mm'],
+                                  'wall_layer_used': wl, 'source': 'bay_snap', 'open_side': f.get('open_side')})
                         break
         except Exception:
             traceback.print_exc()
