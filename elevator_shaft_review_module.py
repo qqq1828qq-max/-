@@ -930,6 +930,34 @@ def _has_elev_token(layer_name):
     return False
 
 
+# 병렬(나란히 붙은) 승강기로 묶는 차실 사이 최대 거리(차실 사각형 가장자리 간 최단거리, mm). 실측(두 도면):
+# 같은 벽 안의 병렬 쌍은 600mm(한 쌍만 1000mm), 단독과 이웃 쌍/ㄱ자·마주 보기는 2555mm 이상.
+PARALLEL_MAX_GAP_MM = 1200.0
+
+
+def _rect_gap(c1, c2):
+    """두 클러스터의 차실 사각형(rotated_rect) 가장자리 사이 최단거리."""
+    def _pd(a, b, c):
+        dx, dy = c[0] - b[0], c[1] - b[1]
+        ln = dx * dx + dy * dy
+        t = 0.0 if ln == 0 else max(0.0, min(1.0, ((a[0] - b[0]) * dx + (a[1] - b[1]) * dy) / ln))
+        return math.hypot(a[0] - (b[0] + t * dx), a[1] - (b[1] + t * dy))
+    A = c1['rotated_rect']['points']
+    B = c2['rotated_rect']['points']
+    best = float('inf')
+    for i in range(len(A)):
+        a0, a1 = A[i], A[(i + 1) % len(A)]
+        for j in range(len(B)):
+            b0, b1 = B[j], B[(j + 1) % len(B)]
+            best = min(best, _pd(a0, b0, b1), _pd(a1, b0, b1), _pd(b0, a0, a1), _pd(b1, a0, a1))
+    return best
+
+
+def _linkable(c1, c2):
+    """병렬 코어로 묶을 수 있는 두 승강기인지: 문 방향이 같고 차실 사이 거리가 PARALLEL_MAX_GAP_MM 이내."""
+    return _same_door(c1, c2) and _rect_gap(c1, c2) <= PARALLEL_MAX_GAP_MM
+
+
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
                                  size_min_mm: float = 1300.0, size_max_mm: float = 7000.0,
                                  cluster_dist_mm: float = 4000.0, merge_bbox_cap_mm: float = 4500.0,
@@ -1181,8 +1209,8 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
         cj = entity_to_cluster_idx.get(j)
         if ci is None or cj is None or ci == cj:
             continue
-        if not _same_door(clusters[ci], clusters[cj]):
-            continue          # 문 방향이 다르면 나란히 붙어 있어도 병렬 코어로 보지 않는다
+        if not _linkable(clusters[ci], clusters[cj]):
+            continue          # 문 방향이 다르거나 차실 사이가 멀면(PARALLEL_MAX_GAP_MM 초과) 병렬 코어가 아님
         ra, rb = _group_find(ci), _group_find(cj)
         if ra != rb:
             group_parent[ra] = rb
@@ -1216,8 +1244,8 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             aligned_y = gy <= OVERLAP_TOL_MM and OVERLAP_TOL_MM < gx <= PARALLEL_GAP_MM
             if not (aligned_x or aligned_y):
                 continue
-            if not _same_door(clusters[ci], clusters[cj]):
-                continue      # 문 방향이 다르면(직각/마주 보기) 병렬이 아님
+            if not _linkable(clusters[ci], clusters[cj]):
+                continue      # 문 방향이 다르거나(직각/마주 보기) 차실 사이가 멀면 병렬이 아님
             ra, rb = _group_find(ci), _group_find(cj)
             if ra != rb:
                 group_parent[ra] = rb
@@ -2023,9 +2051,19 @@ def _snap_parallel_bays(segs, members, bay_of=None, min_size_mm: float = 1200.0,
         if not all(min_size_mm <= r[1] - r[0] <= max_size_mm and min_size_mm <= r[3] - r[2] <= max_size_mm
                    for r in rects.values()):
             continue
+        bay_corners = [_rotate_point(gcx + x, gcy + y, angle, (gcx, gcy))
+                       for x, y in ((L, B), (R, B), (R, T), (L, T))]
         for i, (rl, rr_, rb, rt) in rects.items():
             corners = [(rl, rb), (rr_, rb), (rr_, rt), (rl, rt)]
             world = [_rotate_point(gcx + x, gcy + y, angle, (gcx, gcy)) for x, y in corners]
+            if shared:
+                # 칸막이 없이 한 벽 안에 든 공용 승강로는 '하나의 승강로'다 — 폴리선과 치수는 승강로 전체를 쓴다
+                # (칸별 분할값은 car_width/car_depth로만 남긴다).
+                out[i] = {'points': bay_corners, 'width_mm': round(R - L, 1), 'depth_mm': round(T - B, 1),
+                          'car_width_mm': round(rr_ - rl, 1), 'car_depth_mm': round(rt - rb, 1),
+                          'shared': True, 'bay_n': len(idxs), 'bay_total': (round(R - L, 1), round(T - B, 1)),
+                          'open_side': open_side}
+                continue
             out[i] = {'points': world, 'width_mm': round(rr_ - rl, 1), 'depth_mm': round(rt - rb, 1),
                       'shared': shared, 'bay_n': len(idxs), 'bay_total': (round(R - L, 1), round(T - B, 1)),
                       'open_side': open_side}
@@ -2060,7 +2098,7 @@ def _result_tag(r):
         tag += ' ⚠문쪽 벽선 없음→추정'
     if r.get('source') == 'bay_shared' and r.get('bay_info'):
         n, tw, td = r['bay_info']
-        tag += f" ✎공용승강로{n}대(골조내측 {tw:.0f}x{td:.0f})"
+        tag += f" ✎공용승강로{n}대 하나의 승강로({tw:.0f}x{td:.0f})"
     return tag
 
 
@@ -3042,11 +3080,23 @@ class ElevatorShaftReviewModule:
             messagebox.showinfo('안내', "먼저 '③ 벽체 스냅'을 실행하세요.")
             return
         shapes = []
+        merged = {}      # 같은 폴리선(공용 승강로) → shapes 항목
         for r in self.parking_shaft_results:
             cap_part = f" {r['capacity_guess']}인승" if r.get('capacity_guess') else ''
-            label = (f"{r.get('core_label', '#' + str(r['index']))} "
-                     f"{r['width_mm']:.0f}x{r['depth_mm']:.0f}{cap_part}{_result_tag(r)}")
-            shapes.append({'points': r['points'], 'label': label, 'layer': '승강로 사이즈'})
+            core = r.get('core_label', '#' + str(r['index']))
+            key = tuple((round(x), round(y)) for x, y in r['points']) if r.get('source') == 'bay_shared' else None
+            if key is not None and key in merged:
+                it = merged[key]
+                it['cores'].append(core + cap_part)
+                open_tag = ' ⚠문쪽 벽선 없음→추정' if r.get('open_side') else ''
+                it['label'] = (f"{'·'.join(it['cores'])} 공용승강로{r['bay_info'][0]}대(하나의 승강로) "
+                               f"{r['width_mm']:.0f}x{r['depth_mm']:.0f}{open_tag}")
+                continue
+            label = f"{core} {r['width_mm']:.0f}x{r['depth_mm']:.0f}{cap_part}{_result_tag(r)}"
+            item = {'points': r['points'], 'label': label, 'layer': '승강로 사이즈', 'cores': [core + cap_part]}
+            shapes.append(item)
+            if key is not None:
+                merged[key] = item
         out_path = write_shaft_layer_dxf(self.parking_source_path, shapes,
                                           layer_name='승강로 사이즈', suffix='_승강로검토')
         if out_path:
