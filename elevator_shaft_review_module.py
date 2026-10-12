@@ -766,6 +766,52 @@ def _snap_bbox_to_wall_segs_any_angle(segs, guess_bbox_world, layer_hint: str = 
 #  후보로 인정한다. AI 이미지 판독 없이 벡터 좌표로 직접 찾으므로 빠르고
 #  정확하며, 전체를 렌더링/분석할 필요 없이 그 좌표 주변만 잘라 쓸 수 있다.
 # ──────────────────────────────────────────────────────────────
+def _door_direction(member_segs, center, angle_deg, min_asym: float = 60.0):
+    """승강기 심볼의 문(승강장) 방향을 기하로 읽는다 — 월드 좌표의 단위벡터 (dx, dy), 못 읽으면 None.
+    심볼의 문은 차실 사각형 바깥 한쪽에 붙은 짧은 선(실측: 중심에서 ±963mm, 길이 1400mm)이고, 차실
+    윤곽선(±806~935)과 십자선(중심 통과)은 그보다 안쪽이다. 그래서 심볼 선분을 심볼 축 기준 로컬
+    좌표로 돌려, 축에 평행한 선분 중 중심에서 가장 멀리 떨어진 선의 방향을 문 쪽으로 본다. 반대편
+    최대 거리와의 차이가 min_asym 미만이면(좌우 대칭이라 문을 구별할 수 없음) None."""
+    best = {'+x': 0.0, '-x': 0.0, '+y': 0.0, '-y': 0.0}
+    for x0, y0, x1, y1 in member_segs:
+        p0 = _rotate_point(x0, y0, -angle_deg, center)
+        p1 = _rotate_point(x1, y1, -angle_deg, center)
+        lx0, ly0, lx1, ly1 = p0[0] - center[0], p0[1] - center[1], p1[0] - center[0], p1[1] - center[1]
+        dx, dy = abs(lx1 - lx0), abs(ly1 - ly0)
+        if max(dx, dy) < 300.0:
+            continue
+        if dy <= 0.05 * max(dx, 1.0):          # 가로선 — 법선은 y
+            o = (ly0 + ly1) / 2
+            key = '+y' if o > 0 else '-y'
+        elif dx <= 0.05 * max(dy, 1.0):        # 세로선 — 법선은 x
+            o = (lx0 + lx1) / 2
+            key = '+x' if o > 0 else '-x'
+        else:
+            continue
+        best[key] = max(best[key], abs(o))
+    # 한 축에서 양쪽 최대 거리의 차이가 가장 큰 축을 문 축으로 본다
+    cand = []
+    for ax in ('x', 'y'):
+        a, b = best['+' + ax], best['-' + ax]
+        if abs(a - b) >= min_asym:
+            cand.append((abs(a - b), ('+' if a > b else '-') + ax))
+    if not cand:
+        return None
+    _gap, key = max(cand)
+    u = {'+x': (1.0, 0.0), '-x': (-1.0, 0.0), '+y': (0.0, 1.0), '-y': (0.0, -1.0)}[key]
+    rad = math.radians(angle_deg)
+    return (u[0] * math.cos(rad) - u[1] * math.sin(rad), u[0] * math.sin(rad) + u[1] * math.cos(rad))
+
+
+def _same_door(c1, c2, min_dot: float = 0.9):
+    """두 승강기의 문 방향이 같은지(병렬 코어 조건). 한쪽이라도 문 방향을 못 읽었으면 판단하지 않고
+    True(기존 동작 유지)."""
+    d1, d2 = c1.get('door'), c2.get('door')
+    if not d1 or not d2:
+        return True
+    return d1[0] * d2[0] + d1[1] * d2[1] >= min_dot
+
+
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
                                  size_min_mm: float = 1300.0, size_max_mm: float = 7000.0,
                                  cluster_dist_mm: float = 4000.0, merge_bbox_cap_mm: float = 4500.0,
@@ -973,6 +1019,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             'n_entities': len(idxs),
             'layers': sorted({found[i][8] for i in idxs}),
             'rotated_rect': rotated_rect,
+            'door': _door_direction(member_segs, center, rotated_rect['angle']),
         })
         cluster_idxs_list.append(idxs)
 
@@ -1000,6 +1047,8 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
         cj = entity_to_cluster_idx.get(j)
         if ci is None or cj is None or ci == cj:
             continue
+        if not _same_door(clusters[ci], clusters[cj]):
+            continue          # 문 방향이 다르면 나란히 붙어 있어도 병렬 코어로 보지 않는다
         ra, rb = _group_find(ci), _group_find(cj)
         if ra != rb:
             group_parent[ra] = rb
@@ -1033,6 +1082,8 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             aligned_y = gy <= OVERLAP_TOL_MM and OVERLAP_TOL_MM < gx <= PARALLEL_GAP_MM
             if not (aligned_x or aligned_y):
                 continue
+            if not _same_door(clusters[ci], clusters[cj]):
+                continue      # 문 방향이 다르면(직각/마주 보기) 병렬이 아님
             ra, rb = _group_find(ci), _group_find(cj)
             if ra != rb:
                 group_parent[ra] = rb
