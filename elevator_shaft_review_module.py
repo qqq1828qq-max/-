@@ -2436,7 +2436,7 @@ class ElevatorShaftReviewModule:
 
         tk.Label(card, text='1. 지하주차장 전체평면도 승강로 탐지', font=FH, bg=SURFACE, fg=TEXT_PRIMARY).pack(anchor='w')
         tk.Label(card, text='승강기 관련 텍스트가 전혀 없는 지하주차장(또는 그 외 텍스트 없는) 전체평면도 DXF를 '
-                            '선택하면, 승강기 심볼(ELEV 계열 레이어) 형상만으로 승강로 위치를 찾고, AI가 벽체 '
+                            '불러온 뒤(📂 도면 불러오기), 승강기 심볼 형상만으로 승강로 위치를 찾고, AI가 벽체 '
                             '(콘크리트 구조체) 레이어를 판별해 그 벽에 스냅한 실측 폭/깊이를 뽑아냅니다. '
                             '"인승" 표기가 심볼 근처에 있으면 함께 인식합니다. 동 전체가 한 장에 들어있는 '
                             '전체평면도 1개만 넣으면 되고, 동별로 나눠 넣을 필요는 없습니다.',
@@ -2448,9 +2448,13 @@ class ElevatorShaftReviewModule:
         # 스냅됐는지를 각각 확인한 뒤 다음 단계로 넘어간다.
         btn_row = tk.Frame(card, bg=SURFACE)
         btn_row.pack(fill='x', pady=(4, 0))
+        self.btn_load_dxf = self._metal_btn(btn_row, '📂 도면 불러오기', self._run_parking_load_dxf,
+                                             text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
+        self.btn_load_dxf.pack(side='left')
         self.btn_step1 = self._metal_btn(btn_row, '① 승강기 심볼 위치 탐지', self._run_parking_step1_detect,
                                           text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
-        self.btn_step1.pack(side='left')
+        self.btn_step1.pack(side='left', padx=(10, 0))
+        self.btn_step1.config(state='disabled')   # 도면을 불러온 뒤에 활성화
         self.btn_step2 = self._metal_btn(btn_row, '② AI 벽체 레이어 판별', self._run_parking_step2_identify_walls)
         self.btn_step2.pack(side='left', padx=(10, 0))
         self.btn_step2.config(state='disabled')
@@ -2463,6 +2467,10 @@ class ElevatorShaftReviewModule:
         self.btn_step5 = self._metal_btn(btn_row, '⑤ 확정 검토표에 일괄 반영', self._run_parking_step5_apply_to_table)
         self.btn_step5.pack(side='left', padx=(10, 0))
         self.btn_step5.config(state='disabled')
+
+        self.lbl_dxf_file = tk.Label(card, text='불러온 도면: 없음 — 먼저 "📂 도면 불러오기"로 DXF를 선택하세요.',
+                                      font=FS, bg=SURFACE, fg=TEXT_MUTED, anchor='w', justify='left')
+        self.lbl_dxf_file.pack(anchor='w', pady=(8, 0))
 
         # ── 진행률 표시줄 ──
         style = ttk.Style()
@@ -2628,19 +2636,54 @@ class ElevatorShaftReviewModule:
         return result
 
     # ── ① 승강기 심볼 위치 탐지 (로컬 전용 — AI 호출 없음, 빠르고 정확) ──
-    def _run_parking_step1_detect(self):
+    def _reset_parking_state(self):
+        """새 도면을 불러올 때 이전 도면의 탐지 결과/벽 레이어/스냅 결과와 단계 버튼 상태를 모두 비운다
+        (검토표 self.rows는 건드리지 않는다 — ⑤에서 현재 도면 결과로 교체된다)."""
+        self.parking_clusters = []
+        self.parking_wall_layers = []
+        self.parking_shaft_results = []
+        self._clear_parking_tree()
+        for b in (self.btn_step2, self.btn_step3, self.btn_step4, self.btn_step5):
+            b.config(state='disabled')
+        self._reset_progress(0)
+
+    def _run_parking_load_dxf(self):
+        """도면(DXF)만 불러온다. 탐지는 ① 버튼이 따로 실행한다."""
         path = filedialog.askopenfilename(
             title="승강로를 자동탐지할 지하주차장(또는 승강기 텍스트가 없는) 전체평면도 DXF 선택",
             filetypes=[('DXF Files', '*.dxf'), ('All Files', '*.*')]
         )
         if not path:
-            return
+            return False
         self.parking_source_path = path
+        self._reset_parking_state()
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            size_txt = f' ({size_mb:.1f}MB)'
+        except Exception:
+            size_txt = ''
+        self.lbl_dxf_file.config(text=f'불러온 도면: {os.path.basename(path)}{size_txt}', fg=TEXT_PRIMARY)
+        self.btn_step1.config(state='normal')
+        self.lbl_ai_status.config(
+            text=f'📂 "{os.path.basename(path)}"을(를) 불러왔습니다. 다음: ① 승강기 심볼 위치 탐지를 실행하세요.',
+            fg=ACCENT_SUCCESS)
+        return True
+
+    def _run_parking_step1_detect(self):
+        path = self.parking_source_path
+        if not path:
+            # 도면을 아직 안 불러왔으면 여기서 바로 불러온다(불러오기를 취소하면 중단)
+            if not self._run_parking_load_dxf():
+                return
+            path = self.parking_source_path
         self.parking_clusters = []
         self.parking_wall_layers = []
         self.parking_shaft_results = []
         self._clear_parking_tree()
+        for b in (self.btn_step2, self.btn_step3, self.btn_step4, self.btn_step5):
+            b.config(state='disabled')
         self.btn_step1.config(state='disabled')
+        self.btn_load_dxf.config(state='disabled')
         self._reset_progress(0)
         self.lbl_ai_status.config(
             text=f'① "{os.path.basename(path)}"에서 승강기 심볼로 승강로 위치를 찾는 중...',
@@ -2657,6 +2700,7 @@ class ElevatorShaftReviewModule:
 
     def _on_parking_step1_done(self, clusters):
         self.btn_step1.config(state='normal')
+        self.btn_load_dxf.config(state='normal')
         self._finish_progress(len(clusters) or 1)
         self.parking_clusters = clusters
         if not clusters:
@@ -3116,6 +3160,19 @@ class ElevatorShaftReviewModule:
         # 승강로들(group_id가 같음)은 "같은 코어에 나란히 붙은 승강로"로 보고
         # 같은 코어 번호 + 배치="병렬"로, 혼자인 승강로는 배치="단독"으로
         # 검토표에 반영한다(이전에는 전부 "단독"으로 잘못 표시됐었음).
+        # 검토표는 누적하지 않는다 — 현재 도면의 결과만 담는다(여러 도면을 돌려도 이전 도면 행이 섞이지 않음).
+        # 사용자가 표에서 직접 입력한 '동' 구분이 있으면 지우기 전에 한 번 확인한다.
+        if self.rows:
+            if any(r.get('dong') for r in self.rows) and not messagebox.askyesno(
+                    '검토표 교체',
+                    f'검토표에 있는 {len(self.rows)}행(직접 입력한 동 구분 포함)을 지우고\n'
+                    '현재 도면의 결과로 교체합니다. 계속할까요?\n\n'
+                    '(필요하면 먼저 💾 진행상태 저장으로 보관하세요.)'):
+                return
+            self.rows = []
+            self._row_seq = 0
+            for i in self.tree.get_children():
+                self.tree.delete(i)
         n_added = 0
         n_low_conf = 0
         # 코어 번호/A·B·C는 ③에서 _assign_core_labels로 이미 부여돼 있다 — ④ 도면
@@ -3132,7 +3189,7 @@ class ElevatorShaftReviewModule:
                 core=core_label, cap=r.get('capacity_guess'), layout=layout,
                 w=r.get('width_mm'), d=r.get('depth_mm'))
             n_added += 1
-        msg = f'✅ ⑤ 확정 승강로 전체 검토표에 {n_added}건을 추가했습니다(동 구분은 직접 입력하세요).'
+        msg = f'✅ ⑤ 확정 승강로 전체 검토표를 현재 도면 결과 {n_added}건으로 교체했습니다(동 구분은 직접 입력하세요).'
         if n_low_conf:
             msg += f' ⚠ {n_low_conf}건은 벽체 미검출(심볼 윤곽 크기)로 표시됨 — 도면에서 직접 확인 필요.'
         self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS if not n_low_conf else ACCENT_WARNING)
