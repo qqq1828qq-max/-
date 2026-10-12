@@ -140,6 +140,31 @@ def _point_in_clip_stack(pt, clip_stack):
     return True
 
 
+def _hidden_layer_names(doc):
+    """캐드 화면에 보이지 않는 레이어(동결 Freeze / 꺼짐 Off) 이름 집합. 이런 레이어에는 설계 정의용
+    기준선(예: '0-Def-기준Wall')처럼 도면 사용자가 볼 수 없는 형상이 들어 있는 경우가 많다 — 실측: 동결된
+    기준선 레이어에 스냅해 구조체(G-CON)보다 승강로 치수가 60mm 작게 나왔다. 사람이 도면에서 보는 것과
+    같은 기준으로 치수를 따도록, 모든 수집 단계에서 이 레이어의 개체(블록 안의 개체 포함)를 제외한다."""
+    hidden = set()
+    try:
+        for lay in doc.layers:
+            try:
+                if lay.is_frozen() or not lay.is_on():
+                    hidden.add(lay.dxf.name)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return hidden
+
+
+def _insert_hidden(e, hidden):
+    try:
+        return bool(hidden) and (e.dxf.layer in hidden)
+    except Exception:
+        return False
+
+
 def _wall_segment_candidates(msp, layer_hint='골조', max_block_depth=6):
     """평면도의 벽/기둥(골조) 레이어에 그려진 개별 선분들을 모두 모은다. 이 도면들은
     승강로 개구부를 감싸는 닫힌 도형이 없는 대신, 벽이 개별 LINE(또는 열린
@@ -160,13 +185,14 @@ def _wall_segment_candidates(msp, layer_hint='골조', max_block_depth=6):
     # 더 가까워 잘못된 경계로 뽑힐 수 있음). 벽 레이어가 아닌 것이 명백한
     # 중심선/그리드 계열 서브레이어는 '골조' 부분일치와 무관하게 항상 제외한다.
     _NON_WALL_LAYER_TOKENS = ('CEN', '중심선', 'GRID', '그리드')
+    hidden = _hidden_layer_names(msp.doc)
 
     def _layer_matches(e):
         try:
             layer = e.dxf.layer or ''
         except Exception:
             return False
-        if layer_hint not in layer:
+        if layer in hidden or layer_hint not in layer:
             return False
         layer_upper = layer.upper()
         if any(tok.upper() in layer_upper for tok in _NON_WALL_LAYER_TOKENS):
@@ -210,7 +236,7 @@ def _wall_segment_candidates(msp, layer_hint='골조', max_block_depth=6):
             except Exception:
                 continue
             if etype == 'INSERT':
-                if depth >= max_block_depth:
+                if depth >= max_block_depth or _insert_hidden(e, hidden):
                     continue
                 clip_poly = _active_xclip_polygon_world(e)
                 new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
@@ -277,7 +303,8 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
     3변 이상에, 심볼 가장자리 바깥(또는 25% 안쪽)~near_out_mm 이내로 그 변 길이의 min_cover 이상을 덮는
     선이 있는 승강로 수. 이름이나 AI 나열 순서가 아니라 도면 기하로 구조체 레이어를 고른다.
     반환: [(layer, score, 덮는 승강로 index 집합)] 점수 내림차순."""
-    cand = set(candidates)
+    hidden = _hidden_layer_names(msp.doc)
+    cand = set(candidates) - hidden
     if not cand or not clusters:
         return []
     info = []
@@ -314,7 +341,7 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
             except Exception:
                 continue
             if et == 'INSERT':
-                if depth >= max_block_depth:
+                if depth >= max_block_depth or _insert_hidden(e, hidden):
                     continue
                 clip_poly = _active_xclip_polygon_world(e)
                 new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
@@ -780,8 +807,11 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
         return []
 
     kws = [k.upper() for k in layer_keywords]
+    hidden = _hidden_layer_names(doc)
 
     def _layer_matches(layer_name):
+        if layer_name in hidden:
+            return False
         up = (layer_name or '').upper()
         return any(k in up for k in kws)
 
@@ -831,7 +861,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                             segs = [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1])
                                     for k in range(len(pts) - 1)] if etype != 'ARC' else []
                             found.append((cx, cy, min(xs), min(ys), max(xs), max(ys), pts, segs, layer))
-            elif etype == 'INSERT' and depth < max_block_depth:
+            elif etype == 'INSERT' and depth < max_block_depth and not _insert_hidden(e, hidden):
                 clip_poly = _active_xclip_polygon_world(e)
                 new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
                 try:
@@ -1034,8 +1064,11 @@ def _collect_layer_line_stats(dxf_path: str, max_block_depth: int = 6):
         return []
 
     stats = {}
+    hidden = _hidden_layer_names(doc)
 
     def _add(layer, length):
+        if layer in hidden:
+            return
         rec = stats.setdefault(layer, {'count': 0, 'total_length_mm': 0.0})
         rec['count'] += 1
         rec['total_length_mm'] += length
@@ -1047,7 +1080,7 @@ def _collect_layer_line_stats(dxf_path: str, max_block_depth: int = 6):
             except Exception:
                 continue
             if etype == 'INSERT':
-                if depth >= max_block_depth:
+                if depth >= max_block_depth or _insert_hidden(e, hidden):
                     continue
                 clip_poly = _active_xclip_polygon_world(e)
                 new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
@@ -1735,6 +1768,9 @@ def _result_tag(r):
     """③ 결과 한 건의 신뢰도/구조 표시(미리보기·④ 도면 라벨·⑤ 검토표 공용)."""
     tag = {'wall_snap': '', 'ai_group_fix': ' ✎AI보정', 'bay_snap': '',
            'bay_shared': ''}.get(r.get('source'), ' ⚠벽미검출')
+    used, primary = r.get('wall_layer_used'), r.get('primary_layer')
+    if used and primary and used != primary:
+        tag += f" ⚠보조레이어({_pretty_layer(used)})"
     if r.get('source') == 'bay_shared' and r.get('bay_info'):
         n, tw, td = r['bay_info']
         tag += f" ✎공용승강로{n}대(골조내측 {tw:.0f}x{td:.0f})"
@@ -2354,21 +2390,14 @@ class ElevatorShaftReviewModule:
             ranked = _rank_wall_layers(msp, self.parking_clusters, cands)
             info['scores'] = [(l, sc) for l, sc, _cv in ranked]
             if ranked:
-                # 점수 1위를 기본으로 하고, 1위가 못 덮는 승강로를 덮어주는 레이어를 최대 4개까지 보완
-                # 선택한다(같은 도면 안에서도 승강로마다 구조체 레이어가 다를 수 있다 — 예: 대부분은
-                # G-CON인데 일부 승강로는 CON). 하나의 벽선 집합으로 합쳐 '가장 가까운 선'을 쓴다.
-                chosen = [ranked[0][0]]
-                covered_all = set(ranked[0][2])
-                while len(chosen) < 4:
-                    gain = [(len(cv - covered_all), l, cv) for l, _sc, cv in ranked if l not in chosen]
-                    gain = [g for g in gain if g[0] >= 1]
-                    if not gain:
-                        break
-                    gain.sort(key=lambda g: -g[0])
-                    chosen.append(gain[0][1])
-                    covered_all |= gain[0][2]
-                info['covered'] = len(covered_all)
-                wall_layers = ['|'.join(chosen)] + chosen if len(chosen) > 1 else chosen
+                # 한 도면에서 승강로 골조 레이어는 하나다(동/블록과 무관). 승강로 둘레 인식 점수 1위
+                # 레이어 하나만 쓴다 — 여러 레이어를 합치거나 돌아가며 시도하면 기준선 같은 엉뚱한
+                # 선에 스냅될 수 있다. 화면에서 동결/꺼진 레이어는 후보에서 이미 제외돼 있다.
+                # 단, 기본 레이어에 벽이 하나도 없는 승강로(실측: E.V/계단실 쪽 승강로 4곳은 벽이 G-CON이
+                # 아니라 CON에 그려져 있음)를 위해 점수 순으로 보조 레이어 최대 2개를 뒤에 붙인다.
+                # ③은 기본 레이어에서 벽을 못 찾은 승강로에만 보조 레이어를 쓰고, 그 결과에는 표시를 남긴다.
+                wall_layers = [ranked[0][0]] + [l for l, _sc, _cv in ranked[1:3]]
+                info['covered'] = len(ranked[0][2])
             else:
                 wall_layers = list(info['ai_layers'])
         except Exception as e:
@@ -2454,7 +2483,7 @@ class ElevatorShaftReviewModule:
             score_txt = ', '.join(f"{_pretty_layer(l)} {s_}/{n}곳" for l, s_ in sc[:5])
             msg = f"✅ ② 사용할 벽체(골조) 레이어: {used}"
             if score_txt:
-                msg += f"  [승강로 둘레 인식 점수: {score_txt}; 선택한 레이어 합산 {info.get('covered', 0)}/{n}곳]"
+                msg += f"  [승강로 둘레 인식 점수: {score_txt}; 선택 레이어가 둘러싼 승강로 {info.get('covered', 0)}/{n}곳]"
             ai = info.get('ai_layers') or []
             if ai:
                 msg += f"  (AI 제안: {', '.join(_pretty_layer(a) for a in ai)})"
@@ -2614,6 +2643,7 @@ class ElevatorShaftReviewModule:
                 'index': i, 'center': c['center'], 'points': points,
                 'width_mm': round(width_mm, 1), 'depth_mm': round(depth_mm, 1),
                 'capacity_guess': capacity, 'wall_layer_used': used_layer, 'source': source,
+                'primary_layer': wall_layers[0] if wall_layers else None,
                 'group_id': c.get('group_id', i - 1),
             })
 
