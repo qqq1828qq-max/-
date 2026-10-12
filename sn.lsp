@@ -364,6 +364,7 @@
 ;;; ===========================================================================
 ;;; [SHAFT] Elevator shaft size rectangles -> one layer per core, counted by QT
 ;;; ===========================================================================
+;;; QT runs the QEV step automatically before it tallies (see _SH-AutoRunSafe).
 ;;; QEV takes the shaft-size rectangles written by the elevator review program
 ;;; (closed 4-vertex polylines on the shaft-size layer, each with a text label
 ;;; at its center such as "<core>22A 2800x2500 ...") and, in core order:
@@ -498,12 +499,120 @@
   (strcat (_SH-ShaftWord) " " (_SH-CoreWord) " " (nth 2 info))
 )
 
-(defun c:QEV (/ ss tss txtList i ent ri toks items withTok noTok maxnum width k item id lay_name
-                used doc layers newLayer obj cnt cx cy)
+;;; Core of QEV. ss = selection set of shaft rectangles (closed 4-vertex
+;;; polylines). quiet = T suppresses the per-layer listing (used by the
+;;; automatic run inside QT). Returns the number of rectangles processed.
+(defun _SH-Process (ss quiet / tss txtList i ent ri items withTok noTok maxnum width k item id
+                    lay_name used doc layers newLayer obj cnt old)
+  (setq cnt 0)
+  (vl-load-com)
+  ;; label texts (center of each rectangle) on the shaft-size layer
+  (setq txtList '())
+  (setq tss (ssget "X" (list '(0 . "TEXT") (cons 8 (_SH-SrcLayer)))))
+  (if tss
+    (progn
+      (setq i 0)
+      (repeat (sslength tss)
+        (setq ent (entget (ssname tss i)))
+        (setq txtList (cons (list (cadr (assoc 10 ent)) (caddr (assoc 10 ent)) (cdr (assoc 1 ent))) txtList))
+        (setq i (1+ i))
+      )
+    )
+  )
+  ;; rectangle data: (ent width depth cx cy tokens)
+  (setq items '() i 0)
+  (repeat (sslength ss)
+    (setq ent (ssname ss i))
+    (setq ri (_SH-RectInfo ent))
+    (if ri
+      (setq items (cons (list ent (nth 0 ri) (nth 1 ri) (nth 2 ri) (nth 3 ri)
+                              (_SH-LabelTokens (nth 2 ri) (nth 3 ri) txtList))
+                        items))
+      (if (not quiet) (princ "\n[QEV] Skipped a polyline that is not a 4-vertex rectangle."))
+    )
+    (setq i (1+ i))
+  )
+  (if items
+    (progn
+      ;; core order: labelled rectangles by (core number, letter);
+      ;; unlabelled ones after them, by position
+      (setq withTok (vl-remove-if '(lambda (it) (null (nth 5 it))) items))
+      (setq noTok (vl-remove-if-not '(lambda (it) (null (nth 5 it))) items))
+      (setq withTok (vl-sort withTok
+        '(lambda (a b)
+           (or (< (car (car (nth 5 a))) (car (car (nth 5 b))))
+               (and (= (car (car (nth 5 a))) (car (car (nth 5 b))))
+                    (< (cdr (car (nth 5 a))) (cdr (car (nth 5 b)))))))))
+      (setq noTok (vl-sort noTok
+        '(lambda (a b)
+           (or (< (nth 3 a) (nth 3 b))
+               (and (= (nth 3 a) (nth 3 b)) (< (nth 4 a) (nth 4 b)))))))
+      ;; numbering width (at least 2 digits)
+      (setq maxnum 0)
+      (foreach it withTok
+        (foreach tk (nth 5 it) (if (> (car tk) maxnum) (setq maxnum (car tk))))
+      )
+      (setq maxnum (+ maxnum (length noTok)))
+      (setq width (max 2 (strlen (itoa maxnum))))
+      ;; unlabelled rectangles get the next free numbers
+      (setq k (- maxnum (length noTok)))
+      (setq noTok
+        (mapcar '(lambda (it)
+                   (setq k (1+ k))
+                   (append (list (nth 0 it) (nth 1 it) (nth 2 it) (nth 3 it) (nth 4 it)) (list (list (cons k "")))))
+                noTok))
+      (setq items (append withTok noTok))
+      ;; layers + tag + size
+      (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+      (setq layers (vla-get-Layers doc))
+      (setq used '())
+      (foreach item items
+        (setq id (_SH-IdFromTokens (nth 5 item) width))
+        (if (assoc id used)
+          (progn
+            (setq used (subst (cons id (1+ (cdr (assoc id used)))) (assoc id used) used))
+            (setq id (strcat id "-" (itoa (cdr (assoc id used)))))
+          )
+          (setq used (cons (cons id 1) used))
+        )
+        (setq lay_name (strcat "SHAFT-" id))
+        (if (not (tblsearch "LAYER" lay_name))
+          (progn
+            (setq newLayer (vla-Add layers lay_name))
+            (vl-catch-all-apply 'vla-put-color (list newLayer 30))
+          )
+          ;; the layer already holds rectangles from an earlier run: they would be
+          ;; counted again by QT, so tell the user (always, even in the quiet run)
+          (progn
+            (setq old (ssget "X" (list '(0 . "LWPOLYLINE") (cons 8 lay_name))))
+            (if old
+              (princ (strcat "\n[QEV] Warning: " lay_name " already has " (itoa (sslength old))
+                             " rectangle(s) from an earlier run - QT will count them too."))
+            )
+          )
+        )
+        (setq obj (vlax-ename->vla-object (nth 0 item)))
+        (vla-put-layer obj lay_name)
+        (vla-put-color obj 256)
+        (vla-put-lineweight obj 50)
+        (_SetQData (nth 0 item))
+        (_SH-SetLayerInfo lay_name (nth 1 item) (nth 2 item) (_SH-TokText (nth 5 item)))
+        (if (not quiet)
+          (princ (strcat "\n  " lay_name "  W=" (rtos (nth 1 item) 2 0) "  D=" (rtos (nth 2 item) 2 0)))
+        )
+        (setq cnt (1+ cnt))
+      )
+      (setvar "LWDISPLAY" 1)
+    )
+  )
+  cnt
+)
+
+;;; Manual command: all rectangles on the shaft-size layer, or a selection.
+(defun c:QEV (/ ss cnt)
   (if (_AuthCheck)
     (progn
       (vl-load-com)
-      ;; 1. rectangles: everything on the shaft-size layer, or a manual selection
       (setq ss (ssget "X" (list '(0 . "LWPOLYLINE") (cons 8 (_SH-SrcLayer)))))
       (if (not ss)
         (progn
@@ -514,95 +623,10 @@
       (if (not ss)
         (princ "\n[QEV] Nothing selected.")
         (progn
-          ;; 2. label texts (center of each rectangle) on the shaft-size layer
-          (setq txtList '())
-          (setq tss (ssget "X" (list '(0 . "TEXT") (cons 8 (_SH-SrcLayer)))))
-          (if tss
-            (progn
-              (setq i 0)
-              (repeat (sslength tss)
-                (setq ent (entget (ssname tss i)))
-                (setq txtList (cons (list (cadr (assoc 10 ent)) (caddr (assoc 10 ent)) (cdr (assoc 1 ent))) txtList))
-                (setq i (1+ i))
-              )
-            )
-          )
-          ;; 3. rectangle data: (ent width depth cx cy tokens)
-          (setq items '() i 0)
-          (repeat (sslength ss)
-            (setq ent (ssname ss i))
-            (setq ri (_SH-RectInfo ent))
-            (if ri
-              (setq items (cons (list ent (nth 0 ri) (nth 1 ri) (nth 2 ri) (nth 3 ri)
-                                      (_SH-LabelTokens (nth 2 ri) (nth 3 ri) txtList))
-                                items))
-              (princ "\n[QEV] Skipped a polyline that is not a 4-vertex rectangle.")
-            )
-            (setq i (1+ i))
-          )
-          (if (null items)
+          (setq cnt (_SH-Process ss nil))
+          (if (> cnt 0)
+            (princ (strcat "\n[QEV] " (itoa cnt) " shaft rectangle(s) moved to SHAFT-nn layers. Run QT to tally."))
             (princ "\n[QEV] No usable rectangles.")
-            (progn
-              ;; 4. core order: labelled rectangles by (core number, letter);
-              ;;    unlabelled ones after them, by position
-              (setq withTok (vl-remove-if '(lambda (it) (null (nth 5 it))) items))
-              (setq noTok (vl-remove-if-not '(lambda (it) (null (nth 5 it))) items))
-              (setq withTok (vl-sort withTok
-                '(lambda (a b)
-                   (or (< (car (car (nth 5 a))) (car (car (nth 5 b))))
-                       (and (= (car (car (nth 5 a))) (car (car (nth 5 b))))
-                            (< (cdr (car (nth 5 a))) (cdr (car (nth 5 b)))))))))
-              (setq noTok (vl-sort noTok
-                '(lambda (a b)
-                   (or (< (nth 3 a) (nth 3 b))
-                       (and (= (nth 3 a) (nth 3 b)) (< (nth 4 a) (nth 4 b)))))))
-              ;; numbering width (at least 2 digits)
-              (setq maxnum 0)
-              (foreach it withTok
-                (foreach tk (nth 5 it) (if (> (car tk) maxnum) (setq maxnum (car tk))))
-              )
-              (setq maxnum (+ maxnum (length noTok)))
-              (setq width (max 2 (strlen (itoa maxnum))))
-              ;; unlabelled rectangles get the next free numbers
-              (setq k (- maxnum (length noTok)))
-              (setq noTok
-                (mapcar '(lambda (it)
-                           (setq k (1+ k))
-                           (append (list (nth 0 it) (nth 1 it) (nth 2 it) (nth 3 it) (nth 4 it)) (list (list (cons k "")))))
-                        noTok))
-              (setq items (append withTok noTok))
-              ;; 5. layers + tag + size
-              (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
-              (setq layers (vla-get-Layers doc))
-              (setq used '() cnt 0)
-              (foreach item items
-                (setq id (_SH-IdFromTokens (nth 5 item) width))
-                (if (assoc id used)
-                  (progn
-                    (setq used (subst (cons id (1+ (cdr (assoc id used)))) (assoc id used) used))
-                    (setq id (strcat id "-" (itoa (cdr (assoc id used)))))
-                  )
-                  (setq used (cons (cons id 1) used))
-                )
-                (setq lay_name (strcat "SHAFT-" id))
-                (if (not (tblsearch "LAYER" lay_name))
-                  (progn
-                    (setq newLayer (vla-Add layers lay_name))
-                    (vl-catch-all-apply 'vla-put-color (list newLayer 30))
-                  )
-                )
-                (setq obj (vlax-ename->vla-object (nth 0 item)))
-                (vla-put-layer obj lay_name)
-                (vla-put-color obj 256)
-                (vla-put-lineweight obj 50)
-                (_SetQData (nth 0 item))
-                (_SH-SetLayerInfo lay_name (nth 1 item) (nth 2 item) (_SH-TokText (nth 5 item)))
-                (princ (strcat "\n  " lay_name "  W=" (rtos (nth 1 item) 2 0) "  D=" (rtos (nth 2 item) 2 0)))
-                (setq cnt (1+ cnt))
-              )
-              (setvar "LWDISPLAY" 1)
-              (princ (strcat "\n[QEV] " (itoa cnt) " shaft rectangle(s) moved to SHAFT-nn layers. Run QT to tally."))
-            )
           )
         )
       )
@@ -611,7 +635,30 @@
   (princ)
 )
 
-(princ "\n[QEV] Loaded. Run QEV to put shaft-size rectangles on per-core SHAFT-nn layers for QT.")
+;;; Automatic run, called by QT before it tallies. Silent when the shaft-size
+;;; layer is missing or empty. Never lets an error stop QT.
+(defun _SH-AutoRun (/ ss cnt)
+  (setq ss (ssget "X" (list '(0 . "LWPOLYLINE") (cons 8 (_SH-SrcLayer)))))
+  (if ss
+    (progn
+      (setq cnt (_SH-Process ss T))
+      (if (> cnt 0)
+        (princ (strcat "\n[QEV] Auto: " (itoa cnt) " shaft rectangle(s) moved to SHAFT-nn layers."))
+      )
+    )
+  )
+  (princ)
+)
+
+(defun _SH-AutoRunSafe (/ r)
+  (setq r (vl-catch-all-apply '_SH-AutoRun nil))
+  (if (vl-catch-all-error-p r)
+    (princ (strcat "\n[QEV] Auto step skipped: " (vl-catch-all-error-message r)))
+  )
+  (princ)
+)
+
+(princ "\n[QEV] Loaded. QT now runs QEV automatically first; you can also run QEV by hand.")
 (princ)
 
 ;;; ===========================================================================
@@ -858,6 +905,7 @@
     (progn
       (vl-load-com)
       (_QTEnsureStyle)
+      (_SH-AutoRunSafe)
       (setq *bd_capmap_cache* (_BD_LoadCapMap))
       (setq lenTypes '("AcDbLine" "AcDbPolyline" "AcDb2dPolyline" "AcDbArc"))
       ;; Circle markers (MCL2 fitting markers) count as 1 EA, same as blocks -
