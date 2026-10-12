@@ -112,8 +112,9 @@ def _hidden_layer_names(doc):
     try:
         for lay in doc.layers:
             try:
-                if lay.is_frozen() or not lay.is_on():
-                    hidden.add(lay.dxf.name)
+                nm = lay.dxf.name
+                if lay.is_frozen() or not lay.is_on() or nm.split('$')[-1].strip().lower() == 'defpoints':
+                    hidden.add(nm)
             except Exception:
                 continue
     except Exception:
