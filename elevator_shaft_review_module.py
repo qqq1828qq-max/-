@@ -113,7 +113,7 @@ def _hidden_layer_names(doc):
         for lay in doc.layers:
             try:
                 nm = lay.dxf.name
-                if lay.is_frozen() or not lay.is_on() or nm.split('$')[-1].strip().lower() == 'defpoints':
+                if lay.is_frozen() or not lay.is_on() or nm.split('$')[-1].strip().lower().startswith('defpoint'):
                     hidden.add(nm)
             except Exception:
                 continue
@@ -269,7 +269,7 @@ def _structural_layer_names(stats):
     out = []
     for st in stats:
         up = st['layer'].upper()
-        if st['count'] < 20:
+        if st['count'] < 4:
             continue
         if any(t.upper() in up for t in _STRUCT_NAME_TOKENS) and not any(t.upper() in up for t in _STRUCT_EXCLUDE_TOKENS):
             out.append(st['layer'])
@@ -2674,7 +2674,7 @@ class ElevatorShaftReviewModule:
             # 모든 레이어를 후보 풀에 넣어 기하 점수로만 가린다(중심선/치수/승강기 자체 레이어는 이름으로 제외).
             # (XREF 접두 '지하1층주차장$0$'에도 '주차'가 들어 있으므로 이름 검사는 마지막 부분만 한다)
             geo_cands = [st['layer'] for st in stats
-                         if st['count'] >= 20 and not any(t.upper() in st['layer'].split('$')[-1].upper() for t in
+                         if st['count'] >= 8 and not any(t.upper() in st['layer'].split('$')[-1].upper() for t in
                                                           ('CEN', 'GRID', '중심선', '그리드', 'DIM', '치수', 'TEXT', '주차',
                                                            'DEFPOINT', 'ELEV', '승강'))
                          and not _has_elev_token(st['layer'])]
