@@ -653,6 +653,7 @@ def _dominant_wall_angle_deg(segs, center, radius_mm, min_len_mm: float = 500.0)
     가정)을 반환해 호출부가 그대로 기존 로직으로 진행하게 한다."""
     cx, cy = center
     buckets = Counter()
+    samples = []
     for x0, y0, x1, y1 in segs:
         length = math.hypot(x1 - x0, y1 - y0)
         if length < min_len_mm:
@@ -662,9 +663,19 @@ def _dominant_wall_angle_deg(segs, center, radius_mm, min_len_mm: float = 500.0)
             continue
         angle = math.degrees(math.atan2(y1 - y0, x1 - x0)) % 90.0
         buckets[round(angle)] += 1
+        samples.append((angle, length))
     if not buckets:
         return 0.0
-    return float(buckets.most_common(1)[0][0])
+    peak = float(buckets.most_common(1)[0][0])
+    # 정수 단위로 반올림한 각도는 최대 0.5도 틀려(긴 변 2.6m에서 20mm 가까운 오차) 치수가 어긋난다 —
+    # 최빈 각도 ±2.5도 안 벽선들의 길이 가중 평균으로 소수점 각도까지 정밀화한다.
+    num = den = 0.0
+    for ang, ln in samples:
+        d = (ang - peak + 45.0) % 90.0 - 45.0
+        if abs(d) <= 2.5:
+            num += d * ln
+            den += ln
+    return (peak + num / den) % 90.0 if den > 0 else peak
 
 
 def _rotate_point(x, y, angle_deg, origin):
