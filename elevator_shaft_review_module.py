@@ -313,7 +313,7 @@ def _structural_layer_names(stats):
 
 
 def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
-                       near_out_mm: float = 600.0, min_cover: float = 0.35):
+                       near_out_mm: float = 600.0, min_cover: float = 0.35, debug=None):
     """후보 레이어마다 '승강로 심볼을 실제로 둘러싸는 정도'를 기하로 점수화한다 — 점수 = 심볼 4변 중
     3변 이상에, 심볼 가장자리 바깥(또는 25% 안쪽)~near_out_mm 이내로 그 변 길이의 min_cover 이상을 덮는
     선이 있는 승강로 수. 이름이나 AI 나열 순서가 아니라 도면 기하로 구조체 레이어를 고른다.
@@ -409,19 +409,35 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
 
     scores = Counter()
     covered = defaultdict(set)
+    hug = Counter()          # 승강기 차실 윤곽에 거의 붙어 있는(≤HUG_MM) 승강로 수
+    HUG_MM = 120.0
     for (layer, ci), lines in hits.items():
         ctr, ang, hw, hh, R = info[ci]
         sx, sy = max(150.0, 0.25 * 2 * hw), max(150.0, 0.25 * 2 * hh)
         sides = 0
+        hug_sides = 0
         for orient, edge, lo, hi, sl, sign in (('v', -hw, -hh, hh, sx, -1), ('v', hw, -hh, hh, sx, 1),
                                                 ('h', -hh, -hw, hw, sy, -1), ('h', hh, -hw, hw, sy, 1)):
             sel = [ln for ln in lines if ln[0] == orient and
                    (edge - sl <= ln[1] <= edge + near_out_mm if sign > 0 else edge - near_out_mm <= ln[1] <= edge + sl)]
             if _cov(sel, lo, hi) >= min_cover:
                 sides += 1
+                # 심볼 가장자리에서 가장 가까운 선까지의 바깥쪽 거리 — 벽 안쪽 면은 차실 윤곽보다 최소 수백 mm 밖에
+                # 있지만, 차실 윤곽을 그린 레이어는 거의 0mm(실측: 레이어 '7' — 결과가 X사각형과 같은 1565x2030)
+                gaps = [(ln[1] - edge) if sign > 0 else (edge - ln[1]) for ln in sel if _cov([ln], lo, hi) >= 0.15]
+                if gaps and min(gaps) <= HUG_MM:
+                    hug_sides += 1
         if sides >= 3:
             scores[layer] += 1
             covered[layer].add(ci)
+            if hug_sides >= 3:
+                hug[layer] += 1
+    if debug is not None:
+        debug.extend((l, scores[l], hug[l]) for l in scores)
+    # 대부분의 승강로에서 차실 윤곽에 밀착한 레이어는 벽이 아니라 승강기 도면 자체이므로 제외
+    for layer in list(scores):
+        if hug[layer] >= 0.6 * scores[layer]:
+            del scores[layer]
     return [(layer, sc, covered[layer]) for layer, sc in sorted(scores.items(), key=lambda kv: -kv[1])]
 
 
@@ -2657,7 +2673,16 @@ class ElevatorShaftReviewModule:
             import ezdxf
             msp = ezdxf.readfile(path).modelspace()
             stats = _collect_layer_line_stats(path)
-            cands = list(dict.fromkeys(list(info['ai_layers']) + _structural_layer_names(stats)))
+            name_cands = list(dict.fromkeys(list(info['ai_layers']) + _structural_layer_names(stats)))
+            # 이름에 단서가 없는 벽 레이어('w', 'c' 같은 짧은 이름 — 실측)도 놓치지 않도록, 선이 충분히 있는
+            # 모든 레이어를 후보 풀에 넣어 기하 점수로만 가린다(중심선/치수/승강기 자체 레이어는 이름으로 제외).
+            # (XREF 접두 '지하1층주차장$0$'에도 '주차'가 들어 있으므로 이름 검사는 마지막 부분만 한다)
+            geo_cands = [st['layer'] for st in stats
+                         if st['count'] >= 20 and not any(t.upper() in st['layer'].split('$')[-1].upper() for t in
+                                                          ('CEN', 'GRID', '중심선', '그리드', 'DIM', '치수', 'TEXT', '주차',
+                                                           'DEFPOINT', 'ELEV', '승강'))
+                         and not _has_elev_token(st['layer'])]
+            cands = list(dict.fromkeys(name_cands + geo_cands))
             ranked = _rank_wall_layers(msp, self.parking_clusters, cands)
             info['scores'] = [(l, sc) for l, sc, _cv in ranked]
             if ranked:
@@ -2667,7 +2692,12 @@ class ElevatorShaftReviewModule:
                 # 점수가 1 이상인(승강로 둘레를 실제로 감싼 적 있는) 레이어를 모두 후보로 두고, 우선순위
                 # (골조/CON → 벽체 → 그 밖)와 점수 순으로 정렬한다. ③은 승강로마다 이 순서로 시도해 그 승강로를
                 # 실제로 감싸는 첫 레이어를 쓴다(레이어를 합치지 않는다).
-                cand_layers = [(l, sc) for l, sc, _cv in ranked if sc >= 1][:5]
+                top_sc = ranked[0][1]
+                name_set = set(name_cands)
+                # 이름 단서가 있는 후보는 점수 1 이상이면, 이름 단서가 없는 후보(짧은 이름 등)는 1위 점수의
+                # 30% 이상일 때만 채택해 우연히 승강로 근처를 지나는 잡선 레이어를 걸러낸다.
+                cand_layers = [(l, sc) for l, sc, _cv in ranked
+                               if sc >= 1 and (l in name_set or sc >= 0.3 * top_sc)][:6]
                 cand_layers.sort(key=lambda t: (_layer_priority(t[0]), -t[1]))
                 wall_layers = [l for l, _sc in cand_layers]
                 info['covered'] = len(set().union(*[cv for _l, _sc, cv in ranked if _l in wall_layers])) if wall_layers else 0
