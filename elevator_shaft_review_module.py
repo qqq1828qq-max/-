@@ -232,6 +232,13 @@ _WALL_SEG_CACHE = {}
 
 
 def _cached_wall_segs(msp, dxf_path, layer):
+    """layer가 'A|B'처럼 '|'로 이어진 복합 키면 각 레이어의 벽선을 합친다(여러 레이어를 한 벽선
+    집합으로 보고 '가장 가까운 선'을 고르기 위함 — 실제 구조체 면이 기준선보다 승강로에 가깝다)."""
+    if '|' in layer:
+        out = []
+        for part in layer.split('|'):
+            out += _cached_wall_segs(msp, dxf_path, part)
+        return out
     try:
         key = (dxf_path, os.path.getmtime(dxf_path), layer)
     except Exception:
@@ -239,6 +246,141 @@ def _cached_wall_segs(msp, dxf_path, layer):
     if key not in _WALL_SEG_CACHE:
         _WALL_SEG_CACHE[key] = _wall_segment_candidates(msp, layer_hint=layer) if msp is not None else []
     return _WALL_SEG_CACHE[key]
+
+
+def _pretty_layer(key):
+    """긴 XREF 접두('XR-...$0$')를 떼고 'G-CON + 0-Def-기준Wall' 꼴로 줄여 표시한다."""
+    return ' + '.join(part.split('$')[-1] for part in (key or '').split('|'))
+
+
+_STRUCT_NAME_TOKENS = ('CON', 'WAL', 'WALL', '골조', '벽체', '구조', '기준')
+_STRUCT_EXCLUDE_TOKENS = ('CEN', 'GRID', '중심선', '그리드', 'CONTINUOUS', 'DIM', '치수', 'TEXT', 'FIN', '마감',
+                          'ELEV', '승강', 'LIFT')
+
+
+def _structural_layer_names(stats):
+    """레이어명에 벽/구조체 단서가 있는 후보(AI가 놓쳤을 수 있는 G-CON 같은 이름까지 후보 풀에 넣는다).
+    최종 선택은 이름이 아니라 아래 기하 점수(_rank_wall_layers)가 한다."""
+    out = []
+    for st in stats:
+        up = st['layer'].upper()
+        if st['count'] < 20:
+            continue
+        if any(t.upper() in up for t in _STRUCT_NAME_TOKENS) and not any(t.upper() in up for t in _STRUCT_EXCLUDE_TOKENS):
+            out.append(st['layer'])
+    return out
+
+
+def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
+                       near_out_mm: float = 600.0, min_cover: float = 0.35):
+    """후보 레이어마다 '승강로 심볼을 실제로 둘러싸는 정도'를 기하로 점수화한다 — 점수 = 심볼 4변 중
+    3변 이상에, 심볼 가장자리 바깥(또는 25% 안쪽)~near_out_mm 이내로 그 변 길이의 min_cover 이상을 덮는
+    선이 있는 승강로 수. 이름이나 AI 나열 순서가 아니라 도면 기하로 구조체 레이어를 고른다.
+    반환: [(layer, score, 덮는 승강로 index 집합)] 점수 내림차순."""
+    cand = set(candidates)
+    if not cand or not clusters:
+        return []
+    info = []
+    for c in clusters:
+        rr = c.get('rotated_rect') or {}
+        ang = rr.get('angle', 0.0) or 0.0
+        hw, hh = rr.get('width_mm', 2000.0) / 2, rr.get('height_mm', 2000.0) / 2
+        info.append((c['center'], ang, hw, hh, max(hw, hh) + near_out_mm + 800.0))
+    hits = defaultdict(list)     # (layer, ci) -> [(orient, pos, lo, hi)]
+
+    def _add(layer, pts):
+        for k in range(len(pts) - 1):
+            ax, ay = pts[k]; bx, by = pts[k + 1]
+            if math.hypot(bx - ax, by - ay) < 300.0:
+                continue
+            mx, my = (ax + bx) / 2, (ay + by) / 2
+            for ci, (ctr, ang, hw, hh, R) in enumerate(info):
+                if abs(mx - ctr[0]) > R * 1.5 or abs(my - ctr[1]) > R * 1.5:
+                    continue
+                p0 = _rotate_point(ax, ay, -ang, ctr); p1 = _rotate_point(bx, by, -ang, ctr)
+                x0, y0, x1, y1 = p0[0] - ctr[0], p0[1] - ctr[1], p1[0] - ctr[0], p1[1] - ctr[1]
+                if abs((x0 + x1) / 2) > R or abs((y0 + y1) / 2) > R:
+                    continue
+                a = math.degrees(math.atan2(abs(y1 - y0), abs(x1 - x0)))
+                if a >= 85:
+                    hits[(layer, ci)].append(('v', (x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+                elif a <= 5:
+                    hits[(layer, ci)].append(('h', (y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+
+    def _walk(entities, depth, clip_stack):
+        for e in entities:
+            try:
+                et = e.dxftype()
+            except Exception:
+                continue
+            if et == 'INSERT':
+                if depth >= max_block_depth:
+                    continue
+                clip_poly = _active_xclip_polygon_world(e)
+                new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
+                try:
+                    _walk(e.virtual_entities(), depth + 1, new_stack)
+                except Exception:
+                    continue
+                continue
+            try:
+                layer = e.dxf.layer or '0'
+                if layer not in cand:
+                    continue
+                if et == 'LINE':
+                    pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+                elif et == 'LWPOLYLINE':
+                    pts = [(q[0], q[1]) for q in e.get_points('xy')]
+                    if e.closed and pts:
+                        pts.append(pts[0])
+                elif et == 'POLYLINE':
+                    pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+                else:
+                    continue
+                if len(pts) >= 2:
+                    mid = ((pts[0][0] + pts[-1][0]) / 2, (pts[0][1] + pts[-1][1]) / 2)
+                    if _point_in_clip_stack(mid, clip_stack):
+                        _add(layer, pts)
+            except Exception:
+                continue
+
+    try:
+        _walk(msp, 0, [])
+    except Exception:
+        traceback.print_exc()
+
+    def _cov(lines, lo, hi):
+        if hi <= lo:
+            return 0.0
+        iv = sorted((max(a, lo), min(b, hi)) for _o, _p, a, b in lines if min(b, hi) > max(a, lo))
+        tot, cur = 0.0, None
+        for a, b in iv:
+            if cur and a <= cur[1]:
+                cur = (cur[0], max(cur[1], b))
+            else:
+                if cur:
+                    tot += cur[1] - cur[0]
+                cur = (a, b)
+        if cur:
+            tot += cur[1] - cur[0]
+        return tot / (hi - lo)
+
+    scores = Counter()
+    covered = defaultdict(set)
+    for (layer, ci), lines in hits.items():
+        ctr, ang, hw, hh, R = info[ci]
+        sx, sy = max(150.0, 0.25 * 2 * hw), max(150.0, 0.25 * 2 * hh)
+        sides = 0
+        for orient, edge, lo, hi, sl, sign in (('v', -hw, -hh, hh, sx, -1), ('v', hw, -hh, hh, sx, 1),
+                                                ('h', -hh, -hw, hw, sy, -1), ('h', hh, -hw, hw, sy, 1)):
+            sel = [ln for ln in lines if ln[0] == orient and
+                   (edge - sl <= ln[1] <= edge + near_out_mm if sign > 0 else edge - near_out_mm <= ln[1] <= edge + sl)]
+            if _cov(sel, lo, hi) >= min_cover:
+                sides += 1
+        if sides >= 3:
+            scores[layer] += 1
+            covered[layer].add(ci)
+    return [(layer, sc, covered[layer]) for layer, sc in sorted(scores.items(), key=lambda kv: -kv[1])]
 
 
 def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
@@ -688,7 +830,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                             # 아니라 제외.
                             segs = [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1])
                                     for k in range(len(pts) - 1)] if etype != 'ARC' else []
-                            found.append((cx, cy, min(xs), min(ys), max(xs), max(ys), pts, segs))
+                            found.append((cx, cy, min(xs), min(ys), max(xs), max(ys), pts, segs, layer))
             elif etype == 'INSERT' and depth < max_block_depth:
                 clip_poly = _active_xclip_polygon_world(e)
                 new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
@@ -799,6 +941,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             'center': center,
             'bbox': (x0, y0, x1, y1),
             'n_entities': len(idxs),
+            'layers': sorted({found[i][8] for i in idxs}),
             'rotated_rect': rotated_rect,
         })
         cluster_idxs_list.append(idxs)
@@ -2015,7 +2158,7 @@ class ElevatorShaftReviewModule:
         for r in self.parking_shaft_results:
             self.tree_parking.insert('', 'end', iid=str(r['index']), values=(
                 r.get('core_label', r['index']), f"{r['width_mm']:.0f}", f"{r['depth_mm']:.0f}",
-                r.get('capacity_guess') or '', r['source'], r.get('wall_layer_used') or '',
+                r.get('capacity_guess') or '', r['source'], _pretty_layer(r.get('wall_layer_used')) if r.get('wall_layer_used') else '(미검출)',
             ))
 
     # ── 카드 2: 결과 테이블 (확정 승강로 전체 검토표) ──────────────
@@ -2166,7 +2309,9 @@ class ElevatorShaftReviewModule:
             self.btn_step2.config(state='disabled')
             return
         self.lbl_ai_status.config(
-            text=f'✅ ① 승강기 심볼 {len(clusters)}곳 발견. 다음: ② AI로 벽체 레이어 판별을 실행하세요.',
+            text=(f'✅ ① 승강기 심볼 {len(clusters)}곳 발견 (심볼 레이어: '
+                  f"{', '.join(_pretty_layer(l) for l in sorted({l for c in clusters for l in c.get('layers', [])}))}). "
+                  f'다음: ② 벽체 레이어 판별을 실행하세요.'),
             fg=ACCENT_SUCCESS)
         self.btn_step2.config(state='normal')
 
@@ -2179,9 +2324,8 @@ class ElevatorShaftReviewModule:
         if not api_key:
             messagebox.showwarning(
                 '안내',
-                '벽체(콘크리트 구조체) 레이어를 AI로 자동 판별하려면 API 키가 필요합니다.\n'
-                '상단 "API 설정"에서 키를 입력해주세요. (키가 없으면 승강기 심볼 윤곽만으로 '
-                '대략의 크기를 표시하고, ③ 벽체 스냅은 건너뜁니다.)'
+                'API 키가 없어 AI 제안 없이 진행합니다 — 레이어명(G-CON/WALL 등)과 승강로 둘레 기하 점수로 '
+                '벽체 레이어를 고르고, 승강로 구성(단독/병렬) 판별도 규칙 기반으로 대체됩니다.'
             )
         self.btn_step2.config(state='disabled')
         self._reset_progress(0)
@@ -2191,20 +2335,55 @@ class ElevatorShaftReviewModule:
 
     def _parking_step2_thread(self, path, api_key, model, provider):
         wall_layers = []
+        info = {'ai_layers': [], 'scores': [], 'error': None}
+        try:
+            # (a) AI가 레이어명+선 통계로 벽체 후보를 나열한다(키가 있을 때).
+            if api_key:
+                try:
+                    info['ai_layers'] = self._ai_identify_wall_layers(path, api_key, model, provider)
+                except Exception:
+                    traceback.print_exc()
+            # (b) 이름에 벽/구조체 단서가 있는 레이어도 후보 풀에 넣고(AI가 G-CON을 빼먹는 경우 대비),
+            #     (c) 승강로 심볼을 실제로 둘러싸는 정도(기하 점수)로 최종 순위를 정한다 — AI 나열 순서나
+            #     이름이 아니라 도면 기하가 구조체 레이어를 고른다. 점수 높은 상위 레이어들은 하나의
+            #     벽선 집합으로 합쳐 '가장 가까운 선'을 쓴다(구조체 면이 기준선보다 승강로에 가깝다).
+            import ezdxf
+            msp = ezdxf.readfile(path).modelspace()
+            stats = _collect_layer_line_stats(path)
+            cands = list(dict.fromkeys(list(info['ai_layers']) + _structural_layer_names(stats)))
+            ranked = _rank_wall_layers(msp, self.parking_clusters, cands)
+            info['scores'] = [(l, sc) for l, sc, _cv in ranked]
+            if ranked:
+                # 점수 1위를 기본으로 하고, 1위가 못 덮는 승강로를 덮어주는 레이어를 최대 4개까지 보완
+                # 선택한다(같은 도면 안에서도 승강로마다 구조체 레이어가 다를 수 있다 — 예: 대부분은
+                # G-CON인데 일부 승강로는 CON). 하나의 벽선 집합으로 합쳐 '가장 가까운 선'을 쓴다.
+                chosen = [ranked[0][0]]
+                covered_all = set(ranked[0][2])
+                while len(chosen) < 4:
+                    gain = [(len(cv - covered_all), l, cv) for l, _sc, cv in ranked if l not in chosen]
+                    gain = [g for g in gain if g[0] >= 1]
+                    if not gain:
+                        break
+                    gain.sort(key=lambda g: -g[0])
+                    chosen.append(gain[0][1])
+                    covered_all |= gain[0][2]
+                info['covered'] = len(covered_all)
+                wall_layers = ['|'.join(chosen)] + chosen if len(chosen) > 1 else chosen
+            else:
+                wall_layers = list(info['ai_layers'])
+        except Exception as e:
+            traceback.print_exc()
+            info['error'] = f'벽 레이어 순위 산정 실패: {e}'
+            wall_layers = list(info['ai_layers'])
         summary = None
-        if api_key:
-            try:
-                wall_layers = self._ai_identify_wall_layers(path, api_key, model, provider)
-            except Exception:
-                traceback.print_exc()
-                wall_layers = []
         if wall_layers and self.parking_clusters:
             try:
                 summary = self._classify_parking_layouts(path, self.parking_clusters, wall_layers,
                                                          (api_key, model, provider))
-            except Exception:
+            except Exception as e:
                 traceback.print_exc()
-        self.parent.after(0, lambda: self._on_parking_step2_done(wall_layers, summary))
+                info['error'] = f"승강로 구성(단독/병렬) 판별 실패: {e}"
+        self.parent.after(0, lambda: self._on_parking_step2_done(wall_layers, summary, info))
 
     def _classify_parking_layouts(self, dxf_path, clusters, wall_layers, api):
         """②의 두 번째 일: ①이 거리 규칙으로 묶어둔 후보 그룹마다 "단독인지, 병렬이면 몇 대인지"
@@ -2223,7 +2402,6 @@ class ElevatorShaftReviewModule:
             by_group.setdefault(c.get('group_id', i), []).append(i)
 
         uid = {}
-        counter = Counter()
         n_ai = n_rule = 0
         for gid, idxs in by_group.items():
             members = [clusters[i] for i in idxs]
@@ -2253,30 +2431,51 @@ class ElevatorShaftReviewModule:
                 key = (gid, bay_of[k])
                 if key not in uid:
                     uid[key] = len(uid)
-                clusters[i]['group_id'] = uid[key]
+                # group_id(나란히 붙은 승강기 묶음 = 코어/단독·병렬 표시 기준)는 그대로 두고,
+                # 치수 산출용 bay(골조로 둘러싸인 공간) 구성만 bay_id로 따로 기록한다.
+                clusters[i]['bay_id'] = uid[key]
                 clusters[i]['bay_checked'] = checked
-        sizes = Counter(sum(1 for c in clusters if c['group_id'] == g) for g in set(c['group_id'] for c in clusters))
-        for size, cnt in sizes.items():
-            counter[size] = cnt
-        return {'sizes': dict(counter), 'n_ai': n_ai, 'n_rule': n_rule}
+        layout_sizes = Counter(len(v) for v in by_group.values())
+        bay_members = Counter(c['bay_id'] for c in clusters)
+        bay_sizes = Counter(n for n in bay_members.values() if n >= 2)
+        return {'layout_sizes': dict(layout_sizes), 'bay_sizes': dict(bay_sizes),
+                'n_ai': n_ai, 'n_rule': n_rule}
 
-    def _on_parking_step2_done(self, wall_layers, summary=None):
+    def _on_parking_step2_done(self, wall_layers, summary=None, info=None):
         self.btn_step2.config(state='normal')
         self._finish_progress(1)
         self.parking_wall_layers = wall_layers
         self.btn_step3.config(state='normal')
+        info = info or {}
         if wall_layers:
-            msg = f"✅ ② AI가 판별한 벽체 레이어: {', '.join(wall_layers)}."
+            used = _pretty_layer(wall_layers[0]) if wall_layers else ''
+            sc = info.get('scores') or []
+            n = len(self.parking_clusters or []) or 1
+            score_txt = ', '.join(f"{_pretty_layer(l)} {s_}/{n}곳" for l, s_ in sc[:5])
+            msg = f"✅ ② 사용할 벽체(골조) 레이어: {used}"
+            if score_txt:
+                msg += f"  [승강로 둘레 인식 점수: {score_txt}; 선택한 레이어 합산 {info.get('covered', 0)}/{n}곳]"
+            ai = info.get('ai_layers') or []
+            if ai:
+                msg += f"  (AI 제안: {', '.join(_pretty_layer(a) for a in ai)})"
+            msg += '.'
             if summary:
-                parts = [f"단독 {summary['sizes'].get(1, 0)}곳"] + [
-                    f"병렬 {n}대 {cnt}곳" for n, cnt in sorted(summary['sizes'].items()) if n >= 2]
-                msg += f" 승강로 구성: {', '.join(parts)}"
-                msg += f" (AI 판별 {summary['n_ai']}그룹" + (f", 규칙 대체 {summary['n_rule']}그룹)" if summary['n_rule'] else ")")
+                ls = summary['layout_sizes']
+                n_par = sum(cnt for k, cnt in ls.items() if k >= 2)
+                msg += f" 승강로 구성: 단독 {ls.get(1, 0)}곳, 나란히 붙은 병렬 묶음 {n_par}곳"
+                if summary['bay_sizes']:
+                    msg += " (그중 하나의 골조로 감싸인 공용 승강로 " + ', '.join(
+                        f"{k}대 {cnt}곳" for k, cnt in sorted(summary['bay_sizes'].items())) + ")"
+                msg += f" [AI 판별 {summary['n_ai']}그룹" + (f", 규칙 대체 {summary['n_rule']}그룹]" if summary['n_rule'] else "]")
                 msg += '.'
-            self.lbl_ai_status.config(text=msg + " 다음: ③ 벽체 스냅을 실행하세요.", fg=ACCENT_SUCCESS)
+            if info.get('error'):
+                msg += f" ⚠ {info['error']}"
+            self.lbl_ai_status.config(text=msg + " 다음: ③ 벽체 스냅을 실행하세요.",
+                                      fg=ACCENT_SUCCESS if not info.get('error') else ACCENT_WARNING)
         else:
             self.lbl_ai_status.config(
-                text='⚠ ② 벽체 레이어를 판별하지 못했습니다 — ③을 실행하면 심볼 윤곽 크기(낮은 신뢰도)로 대체됩니다.',
+                text='⚠ ② 벽체 레이어를 판별하지 못했습니다 — ③을 실행하면 심볼 윤곽 크기(낮은 신뢰도)로 대체됩니다.'
+                     + (f" ({info['error']})" if info.get('error') else ''),
                 fg=ACCENT_WARNING)
 
     # ── ③ 실제 벽선에 스냅 ──
@@ -2436,8 +2635,8 @@ class ElevatorShaftReviewModule:
                         except Exception:
                             pass
                     members = [clusters[results[p]['index'] - 1] for p in positions]
-                    # ②에서 단독/병렬·대수가 판정돼 있으면(group_id가 bay) 그 구성을 그대로 따른다
-                    bay_of = [0] * len(members) if all(m.get('bay_checked') for m in members) else None
+                    # ②에서 bay 구성(단독/병렬·대수)이 판정돼 있으면 그대로 따르고, 아니면 골조 포함관계로 직접 판정
+                    bay_of = [m['bay_id'] for m in members] if all(m.get('bay_checked') for m in members) else None
                     for wl in wall_layers[:3]:
                         fixed = _snap_parallel_bays(_segs_for(wl), members, bay_of=bay_of)
                         if len(fixed) != len(positions):
