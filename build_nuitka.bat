@@ -8,7 +8,7 @@ for %%F in (elevator_review_app.py elevator_shaft_review_module.py elevator_secu
 )
 if "%MISSING%"=="1" (echo 위 파일을 이 폴더에 넣고 다시 실행하세요. & pause & exit /b 1)
 
-python -m pip install --upgrade nuitka ordered-set zstandard ezdxf matplotlib
+python -m pip install --upgrade nuitka ordered-set zstandard ezdxf openpyxl
 if errorlevel 1 (echo pip 설치 실패 & pause & exit /b 1)
 
 python -m nuitka --onefile --assume-yes-for-downloads ^
