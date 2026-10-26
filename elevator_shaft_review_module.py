@@ -2614,7 +2614,7 @@ class ElevatorShaftReviewModule:
             if not self._run_parking_load_dxf():
                 return
             path = self.parking_source_path
-        api = self._get_api()
+        api = ('', '', '')     # 분석은 도면 기하만 사용한다(네트워크/API 불필요)
         self._reset_parking_state()
         for b in (self.btn_load_dxf, self.btn_analyze):
             b.config(state='disabled')
