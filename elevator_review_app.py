@@ -31,8 +31,13 @@ class ElevatorReviewApp(tk.Tk):
             messagebox.showerror("접근 거부", f"접근이 허용되지 않은 컴퓨터입니다.\n\nPC: {_pc}")
             self.destroy()
             return
-        self.bind_all('<Control-Shift-G>', lambda _e: _sec.open_user_manager(self))
-        self.bind_all('<Control-Shift-g>', lambda _e: _sec.open_user_manager(self))
+        _sec.bind_admin_hotkey(self)
+        _exp, _left = _sec.expiry_status()
+        if _exp:
+            self.title("승강기 검토")
+            self.geometry("420x120")
+            tk.Label(self, text="사용 기간이 만료되었습니다.\n관리자에게 문의하세요.", pady=30).pack()
+            return
 
         # 윈도우 설정
         self.title("조규수님의 승강기 검토")
