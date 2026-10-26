@@ -277,7 +277,7 @@ class ElevatorReviewApp(tk.Tk):
     #  탭 빌더 — API 설정 / 승강로 CAD 도면 분석
     # ──────────────────────────────────────────────────────────
     def _build_api_tab(self, parent):
-        """API 설정 탭 — NVIDIA/Gemini 키 중앙 관리"""
+        """API 설정 탭 — API 키 중앙 관리"""
         try:
             from api_settings_module import APISettingsModule
             self.api_settings_module = APISettingsModule(parent, self)

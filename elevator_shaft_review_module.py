@@ -2181,7 +2181,15 @@ def _extract_json(text: str) -> dict:
 #  저장 위치는 api_settings_module.py의 설정 파일(.api_settings.json)과
 #  같은 관례로, 프로그램 파일 옆의 숨김 폴더에 프로젝트 1개당 JSON 파일 1개.
 # ──────────────────────────────────────────────────────────────
-PROJECTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.elevator_projects')
+def _user_data_dir():
+    # Nuitka onefile은 __file__이 매번 지워지는 임시 폴더라, 프로젝트 저장 폴더는 exe 옆에 둔다.
+    try:
+        return __compiled__.containing_dir
+    except NameError:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+PROJECTS_DIR = os.path.join(_user_data_dir(), '.elevator_projects')
 
 
 def _ensure_projects_dir():
@@ -2286,7 +2294,7 @@ class ElevatorShaftReviewModule:
     # ── 공통 API 키/모델 조회 ──────────────────────────────────
     def _get_api(self):
         sa = getattr(self.main_app, 'shared_api', None) or {}
-        return sa.get('api_key', ''), sa.get('model', ''), sa.get('provider', 'nvidia')
+        return sa.get('api_key', ''), sa.get('model', ''), sa.get('provider', 'gemini')
 
     # ── 카드 헬퍼 (허브 스타일과 동일) ─────────────────────────
     def _make_card(self, parent, padx=24, pady=20, bg=SURFACE):
@@ -3663,7 +3671,7 @@ class _ProjectManagerDialog(tk.Toplevel):
 if __name__ == '__main__':
     class _FakeMainApp:
         def __init__(self):
-            self.shared_api = {'api_key': '', 'model': '', 'provider': 'nvidia'}
+            self.shared_api = {'api_key': '', 'model': '', 'provider': 'gemini'}
 
     root = tk.Tk()
     root.title('승강로 CAD 도면 분석 (단독 실행)')
