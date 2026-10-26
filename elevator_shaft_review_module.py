@@ -2408,16 +2408,10 @@ class ElevatorShaftReviewModule:
         self.btn_load_dxf = self._metal_btn(btn_row, '📂 도면 불러오기', self._run_parking_load_dxf,
                                              text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
         self.btn_load_dxf.pack(side='left')
-        self.btn_analyze = self._metal_btn(btn_row, '① 승강로 분석하기', self._run_parking_analyze,
+        self.btn_analyze = self._metal_btn(btn_row, '승강로 분석하기', self._run_parking_analyze,
                                             text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
         self.btn_analyze.pack(side='left', padx=(10, 0))
         self.btn_analyze.config(state='disabled')
-        self.btn_mark = self._metal_btn(btn_row, '② 승강로 도면에 표기하기', self._run_parking_step4_export_layer)
-        self.btn_mark.pack(side='left', padx=(10, 0))
-        self.btn_mark.config(state='disabled')
-        self.btn_apply = self._metal_btn(btn_row, '③ 확정 검토표에 일괄 반영', self._run_parking_step5_apply_to_table)
-        self.btn_apply.pack(side='left', padx=(10, 0))
-        self.btn_apply.config(state='disabled')
 
         self.lbl_dxf_file = tk.Label(card, text='불러온 도면: 없음', font=FS, bg=SURFACE, fg=TEXT_MUTED,
                                       anchor='w', justify='left')
@@ -2583,8 +2577,6 @@ class ElevatorShaftReviewModule:
         self.parking_wall_layers = []
         self.parking_shaft_results = []
         self._clear_parking_tree()
-        self.btn_mark.config(state='disabled')
-        self.btn_apply.config(state='disabled')
         self._reset_progress(0)
 
     def _run_parking_load_dxf(self):
@@ -2624,7 +2616,7 @@ class ElevatorShaftReviewModule:
             path = self.parking_source_path
         api = self._get_api()
         self._reset_parking_state()
-        for b in (self.btn_load_dxf, self.btn_analyze, self.btn_mark, self.btn_apply):
+        for b in (self.btn_load_dxf, self.btn_analyze):
             b.config(state='disabled')
         threading.Thread(target=self._parking_analyze_thread, args=(path, api), daemon=True).start()
 
@@ -2658,8 +2650,16 @@ class ElevatorShaftReviewModule:
             messagebox.showwarning('안내', '분석 중 오류가 발생했습니다.' if failed else '승강로를 찾지 못했습니다.')
             return
         self._apply_pct(100)
-        self.btn_mark.config(state='normal')
-        self.btn_apply.config(state='normal')
+        # 분석 결과를 도면에 표기하고 검토표에 반영하는 것까지 한 번에 처리한다.
+        marked = self._run_parking_step4_export_layer(quiet=True)
+        applied = self._run_parking_step5_apply_to_table(quiet=True)
+        if applied is None:
+            return
+        msg = f'분석 완료: 승강로 {applied[0]}건을 검토표에 반영했습니다.'
+        if applied[1]:
+            msg += f'\n벽체 미검출 {applied[1]}건은 도면에서 직접 확인하세요.'
+        msg += ('\n도면 표기본을 원본 옆에 저장했습니다.' if marked else '\n도면 표기본 저장에는 실패했습니다.')
+        messagebox.showinfo('완료', msg)
 
     def _analyze_walls(self, path, clusters, api_key, model, provider):
         wall_layers = []
@@ -2962,10 +2962,9 @@ class ElevatorShaftReviewModule:
         return results
 
     # ── ④ '승강로 사이즈' 레이어로 표시 (사본 DXF 저장) ──
-    def _run_parking_step4_export_layer(self):
+    def _run_parking_step4_export_layer(self, quiet=False):
         if not self.parking_shaft_results:
-            messagebox.showinfo('안내', "먼저 '승강로 분석하기'를 실행하세요.")
-            return
+            return False
         shapes = []
         merged = {}      # 같은 폴리선(공용 승강로) → shapes 항목
         for r in self.parking_shaft_results:
@@ -2984,8 +2983,14 @@ class ElevatorShaftReviewModule:
             shapes.append(item)
             if key is not None:
                 merged[key] = item
-        out_path = write_shaft_layer_dxf(self.parking_source_path, shapes,
-                                          layer_name='승강로 사이즈', suffix='_승강로검토')
+        try:
+            out_path = write_shaft_layer_dxf(self.parking_source_path, shapes,
+                                              layer_name='승강로 사이즈', suffix='_승강로검토')
+        except Exception:
+            traceback.print_exc()
+            out_path = None
+        if quiet:
+            return bool(out_path)
         if out_path:
             msg = f'✅ "승강로 사이즈" 레이어로 표시한 사본을 원본 옆에 저장했습니다: {os.path.basename(out_path)}'
             self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS)
@@ -2995,10 +3000,9 @@ class ElevatorShaftReviewModule:
         messagebox.showinfo('완료' if out_path else '오류', msg)
 
     # ── ⑤ 확정 승강로 전체 검토표에 일괄 반영 ──
-    def _run_parking_step5_apply_to_table(self):
+    def _run_parking_step5_apply_to_table(self, quiet=False):
         if not self.parking_shaft_results:
-            messagebox.showinfo('안내', "먼저 '승강로 분석하기'를 실행하세요.")
-            return
+            return None
         # ①단계에서 크기 상한 때문에 하나로 못 묶었지만 바로 옆에 붙어있던
         # 승강로들(group_id가 같음)은 "같은 코어에 나란히 붙은 승강로"로 보고
         # 같은 코어 번호 + 배치="병렬"로, 혼자인 승강로는 배치="단독"으로
@@ -3011,7 +3015,7 @@ class ElevatorShaftReviewModule:
                     f'검토표에 있는 {len(self.rows)}행(직접 입력한 동 구분 포함)을 지우고\n'
                     '현재 도면의 결과로 교체합니다. 계속할까요?\n\n'
                     '(필요하면 먼저 💾 진행상태 저장으로 보관하세요.)'):
-                return
+                return None
             self.rows = []
             self._row_seq = 0
             for i in self.tree.get_children():
@@ -3036,7 +3040,10 @@ class ElevatorShaftReviewModule:
         if n_low_conf:
             msg += f' ⚠ {n_low_conf}건은 벽체 미검출(심볼 윤곽 크기)로 표시됨 — 도면에서 직접 확인 필요.'
         self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS if not n_low_conf else ACCENT_WARNING)
+        if quiet:
+            return n_added, n_low_conf
         messagebox.showinfo('완료', msg)
+        return n_added, n_low_conf
 
     # ── 진행률 표시줄 ──────────────────────────────────
     # ── 진행률 표시줄 ──────────────────────────────────
