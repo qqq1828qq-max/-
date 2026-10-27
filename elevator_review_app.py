@@ -34,13 +34,13 @@ class ElevatorReviewApp(tk.Tk):
         _sec.bind_admin_hotkey(self)
         _exp, _left = _sec.expiry_status()
         if _exp:
-            self.title("승강기 검토")
+            self.title("승강로 검토 - 전기통신그룹")
             self.geometry("420x120")
             tk.Label(self, text="사용 기간이 만료되었습니다.\n관리자에게 문의하세요.", pady=30).pack()
             return
 
         # 윈도우 설정
-        self.title("조규수님의 승강기 검토")
+        self.title("승강로 검토 - 전기통신그룹")
         self.geometry("1480x940")
         self.minsize(1200, 760)
         self.configure(bg=CANVAS_BG)
