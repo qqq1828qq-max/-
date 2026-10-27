@@ -2458,9 +2458,6 @@ class ElevatorShaftReviewModule:
         parking_vsb.grid(row=0, column=1, sticky='ns')
         parking_tree_frame.grid_columnconfigure(0, weight=1)
 
-        save_row = tk.Frame(card, bg=SURFACE)
-        save_row.pack(fill='x', pady=(10, 0))
-        self._metal_btn(save_row, '💾 진행상태 저장', self._save_session).pack(side='left')
 
     def _clear_parking_tree(self):
         if hasattr(self, 'tree_parking'):
@@ -3021,8 +3018,7 @@ class ElevatorShaftReviewModule:
             if any(r.get('dong') for r in self.rows) and not messagebox.askyesno(
                     '검토표 교체',
                     f'검토표에 있는 {len(self.rows)}행(직접 입력한 동 구분 포함)을 지우고\n'
-                    '현재 도면의 결과로 교체합니다. 계속할까요?\n\n'
-                    '(필요하면 먼저 💾 진행상태 저장으로 보관하세요.)'):
+                    '현재 도면의 결과로 교체합니다. 계속할까요?'):
                 return None
             self.rows = []
             self._row_seq = 0
