@@ -2436,6 +2436,38 @@ class ElevatorShaftReviewModule:
         except Exception:
             pass
 
+    def _ask_layer_names(self, need_elev=True):
+        """승강기/승강로 골조 레이어명(일부 단어 가능)을 입력받는 작은 창. 취소하면 None."""
+        dlg = tk.Toplevel(self.parent)
+        dlg.title('레이어 지정')
+        dlg.transient(self.parent.winfo_toplevel())
+        dlg.resizable(False, False)
+        out = {'v': None}
+        msg = ('승강로를 찾지 못했습니다.' if need_elev else '골조(벽체) 레이어를 찾지 못했습니다.') + \
+              '\n도면의 레이어명(일부 단어)을 입력하세요. 여러 개는 쉼표로 구분합니다.'
+        tk.Label(dlg, text=msg, justify='left', padx=16, pady=10).grid(row=0, column=0, columnspan=2, sticky='w')
+        tk.Label(dlg, text='승강기 레이어').grid(row=1, column=0, sticky='e', padx=(16, 6), pady=4)
+        e1 = tk.Entry(dlg, width=30)
+        e1.grid(row=1, column=1, padx=(0, 16))
+        e1.insert(0, self.var_elev_kw.get())
+        tk.Label(dlg, text='승강로 골조 레이어').grid(row=2, column=0, sticky='e', padx=(16, 6), pady=4)
+        e2 = tk.Entry(dlg, width=30)
+        e2.grid(row=2, column=1, padx=(0, 16))
+        e2.insert(0, self.var_wall_kw.get())
+
+        def ok():
+            out['v'] = (e1.get().strip(), e2.get().strip())
+            dlg.destroy()
+
+        row = tk.Frame(dlg)
+        row.grid(row=3, column=0, columnspan=2, pady=12)
+        tk.Button(row, text='다시 분석', width=10, command=ok).pack(side='left', padx=6)
+        tk.Button(row, text='취소', width=8, command=dlg.destroy).pack(side='left', padx=6)
+        (e1 if need_elev else e2).focus_set()
+        dlg.grab_set()
+        self.parent.wait_window(dlg)
+        return out['v'] if out['v'] and any(out['v']) else None
+
     def _user_layer_keywords(self, wall=False):
         try:
             raw = (self.var_wall_kw if wall else self.var_elev_kw).get()
@@ -2572,16 +2604,8 @@ class ElevatorShaftReviewModule:
                                             text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
         self.btn_analyze.pack(side='left', padx=(10, 0))
         self.btn_analyze.config(state='disabled')
-        tk.Label(btn_row, text='승강기 레이어', font=FS, bg=SURFACE, fg=TEXT_SECONDARY).pack(side='left', padx=(18, 4))
         self.var_elev_kw = tk.StringVar(value=self._load_elev_pref('elev_layer'))
-        ent = tk.Entry(btn_row, textvariable=self.var_elev_kw, width=26, font=FS, relief='solid', bd=1)
-        ent.pack(side='left')
-        ent.bind('<FocusOut>', lambda _e: self._save_elev_pref())
-        tk.Label(btn_row, text='승강로 골조 레이어', font=FS, bg=SURFACE, fg=TEXT_SECONDARY).pack(side='left', padx=(18, 4))
         self.var_wall_kw = tk.StringVar(value=self._load_elev_pref('wall_layer'))
-        ent2 = tk.Entry(btn_row, textvariable=self.var_wall_kw, width=26, font=FS, relief='solid', bd=1)
-        ent2.pack(side='left')
-        ent2.bind('<FocusOut>', lambda _e: self._save_elev_pref())
 
         self.lbl_dxf_file = tk.Label(card, text='불러온 도면: 없음', font=FS, bg=SURFACE, fg=TEXT_MUTED,
                                       anchor='w', justify='left')
@@ -2820,10 +2844,21 @@ class ElevatorShaftReviewModule:
         self.parking_wall_layers = wall_layers
         self.parking_shaft_results = results
         self._refresh_parking_tree()
-        if not results:
+        if not results or not wall_layers:
+            # 자동 탐색(저장된 이름 → 형상)으로 못 찾았을 때만 레이어명을 직접 물어본다.
             self._reset_progress(0)
-            messagebox.showwarning('안내', '분석 중 오류가 발생했습니다.' if failed else '승강로를 찾지 못했습니다.')
-            return
+            if failed:
+                messagebox.showwarning('안내', '분석 중 오류가 발생했습니다.')
+                return
+            got = self._ask_layer_names(need_elev=not results)
+            if got is not None:
+                self.var_elev_kw.set(got[0])
+                self.var_wall_kw.set(got[1])
+                self._save_elev_pref()
+                self.parent.after(50, self._run_parking_analyze)
+                return
+            if not results:
+                return
         self._apply_pct(100)
         # 분석 결과를 도면에 표기하고 검토표에 반영하는 것까지 한 번에 처리한다.
         marked = self._run_parking_step4_export_layer(quiet=True)
