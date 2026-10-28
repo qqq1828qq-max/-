@@ -933,6 +933,111 @@ def _linkable(c1, c2):
     return _same_door(c1, c2) and _rect_gap(c1, c2) <= PARALLEL_MAX_GAP_MM
 
 
+def _geometry_x_fallback(msp, hidden, max_block_depth=6):
+    """레이어/블록 이름 단서로 승강기를 하나도 못 찾았을 때의 보완 — 이름과 무관하게 '형상'으로 찾는다.
+    도면 전체에서 긴 선(1800~9000mm)을 모아, 중점에서 교차하는 같은 길이의 두 선(승강기 X자 대각선)을 찾고,
+    그 사각형(1300~7000mm) 안쪽(+200mm)에 들어오는 선만 심볼 구성 요소로 반환한다(벽선은 더 길어 제외됨).
+    반환: _find_shaft_points_by_layer의 found 항목 목록."""
+    long_segs = []
+
+    def _iter(entities, depth, clip_stack, cb):
+        for e in entities:
+            try:
+                et = e.dxftype()
+            except Exception:
+                continue
+            if et == 'INSERT':
+                if depth >= max_block_depth or _insert_hidden(e, hidden):
+                    continue
+                clip_poly = _active_xclip_polygon_world(e)
+                ns = clip_stack + [clip_poly] if clip_poly else clip_stack
+                try:
+                    _iter(e.virtual_entities(), depth + 1, ns, cb)
+                except Exception:
+                    continue
+            elif et in ('LINE', 'LWPOLYLINE', 'ARC'):
+                try:
+                    layer = e.dxf.layer or '0'
+                    if layer in hidden or layer == '승강로 사이즈':
+                        continue
+                    if et == 'LINE':
+                        pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+                    elif et == 'LWPOLYLINE':
+                        pts = [(q[0], q[1]) for q in e.get_points('xy')]
+                    else:
+                        c, r = e.dxf.center, e.dxf.radius
+                        pts = [(c.x - r, c.y - r), (c.x + r, c.y + r)]
+                    if len(pts) < 2:
+                        continue
+                    mid = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+                    if _point_in_clip_stack(mid, clip_stack):
+                        cb(et, layer, pts)
+                except Exception:
+                    continue
+
+    def _collect_long(et, layer, pts):
+        if et == 'ARC':
+            return
+        for k in range(len(pts) - 1):
+            ln = math.hypot(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1])
+            if 1800.0 <= ln <= 9000.0:
+                long_segs.append((pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]))
+
+    _iter(msp, 0, [], _collect_long)
+    if len(long_segs) < 2:
+        return []
+    cell = 200.0
+    grid = defaultdict(list)
+    for i, sg in enumerate(long_segs):
+        grid[(int(((sg[0] + sg[2]) / 2) // cell), int(((sg[1] + sg[3]) / 2) // cell))].append(i)
+    rects = []
+    for i, a in enumerate(long_segs):
+        ma = ((a[0] + a[2]) / 2, (a[1] + a[3]) / 2)
+        la = math.hypot(a[2] - a[0], a[3] - a[1])
+        gx, gy = int(ma[0] // cell), int(ma[1] // cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in grid.get((gx + dx, gy + dy), ()):
+                    if j <= i:
+                        continue
+                    for cand in _x_candidates([a, long_segs[j]], 1800.0):
+                        r = _x_rect_of(cand)
+                        if 1300.0 <= r['width'] <= 7000.0 and 1300.0 <= r['height'] <= 7000.0:
+                            if not any(math.hypot(r['center'][0] - q['center'][0], r['center'][1] - q['center'][1]) < 200.0
+                                       for q in rects):
+                                rects.append(r)
+    if not rects:
+        return []
+    boxes = []
+    for r in rects:
+        xs = [p[0] for p in r['corners']]
+        ys = [p[1] for p in r['corners']]
+        boxes.append((min(xs) - 200.0, min(ys) - 200.0, max(xs) + 200.0, max(ys) + 200.0))
+    hcell = 3000.0
+    bgrid = defaultdict(list)
+    for bi, b in enumerate(boxes):
+        for cx in range(int(b[0] // hcell), int(b[2] // hcell) + 1):
+            for cy in range(int(b[1] // hcell), int(b[3] // hcell) + 1):
+                bgrid[(cx, cy)].append(bi)
+    found = []
+
+    def _collect_members(et, layer, pts):
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        for bi in bgrid.get((int(((x0 + x1) / 2) // hcell), int(((y0 + y1) / 2) // hcell)), ()):
+            b = boxes[bi]
+            if x0 >= b[0] and y0 >= b[1] and x1 <= b[2] and y1 <= b[3]:
+                cx = sum(xs) / len(xs)
+                cy = sum(ys) / len(ys)
+                segs = [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]) for k in range(len(pts) - 1)] if et != 'ARC' else []
+                found.append((cx, cy, x0, y0, x1, y1, pts, segs, layer))
+                return
+
+    _iter(msp, 0, [], _collect_members)
+    return found
+
+
 _ELEV_BLOCK_RE = re.compile(r'\d{3,4}\s*[Xx×*]\s*\d{3,4}.*(인승|인용)|(인승|인용)')
 
 
@@ -1072,6 +1177,13 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                     continue
 
     _walk(msp, 0, [])
+    if not found:
+        # 이름 단서로 하나도 못 찾았으면 X자 대각선 '형상'으로 보완 탐지한다.
+        try:
+            found = _geometry_x_fallback(msp, hidden, max_block_depth)
+        except Exception:
+            traceback.print_exc()
+            found = []
     if not found:
         return []
 
