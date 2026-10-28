@@ -2402,6 +2402,7 @@ class ElevatorShaftReviewModule:
         # 수 있게 한다.
         self._ukw_cache = []
         self._wkw_cache = []
+        self._wall_prompted = False
         self.parking_source_path = None
         self.parking_clusters = []       # ① 심볼 위치 탐지 결과(벽 스냅 전, bbox만)
         self.parking_wall_layers = []    # ② AI가 판별한 벽체 레이어명 목록
@@ -2436,14 +2437,14 @@ class ElevatorShaftReviewModule:
         except Exception:
             pass
 
-    def _ask_layer_names(self, need_elev=True):
+    def _ask_layer_names(self, need_elev=True, n_miss=0):
         """승강기/승강로 골조 레이어명(일부 단어 가능)을 입력받는 작은 창. 취소하면 None."""
         dlg = tk.Toplevel(self.parent)
         dlg.title('레이어 지정')
         dlg.transient(self.parent.winfo_toplevel())
         dlg.resizable(False, False)
         out = {'v': None}
-        msg = ('승강로를 찾지 못했습니다.' if need_elev else '골조(벽체) 레이어를 찾지 못했습니다.') + \
+        msg = ('승강로를 찾지 못했습니다.' if need_elev else f'벽(골조)을 찾지 못한 승강로가 {n_miss}곳 있습니다.') + \
               '\n도면의 레이어명(일부 단어)을 입력하세요. 여러 개는 쉼표로 구분합니다.'
         tk.Label(dlg, text=msg, justify='left', padx=16, pady=10).grid(row=0, column=0, columnspan=2, sticky='w')
         tk.Label(dlg, text='승강기 레이어').grid(row=1, column=0, sticky='e', padx=(16, 6), pady=4)
@@ -2600,7 +2601,7 @@ class ElevatorShaftReviewModule:
         self.btn_load_dxf = self._metal_btn(btn_row, '📂 도면 불러오기', self._run_parking_load_dxf,
                                              text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
         self.btn_load_dxf.pack(side='left')
-        self.btn_analyze = self._metal_btn(btn_row, '승강로 분석하기', self._run_parking_analyze,
+        self.btn_analyze = self._metal_btn(btn_row, '승강로 분석하기', lambda: self._run_parking_analyze(),
                                             text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
         self.btn_analyze.pack(side='left', padx=(10, 0))
         self.btn_analyze.config(state='disabled')
@@ -2798,13 +2799,15 @@ class ElevatorShaftReviewModule:
         self.progress_bar['value'] = pct
         self.lbl_progress_pct.config(text=f'{pct}%')
 
-    def _run_parking_analyze(self):
+    def _run_parking_analyze(self, retry=False):
         """도면 분석 전체(승강기 탐지 → 벽체 판별 → 치수 산출)를 한 번에 실행한다."""
         path = self.parking_source_path
         if not path:
             if not self._run_parking_load_dxf():
                 return
             path = self.parking_source_path
+        if not retry:
+            self._wall_prompted = False
         self._ukw_cache = self._user_layer_keywords()
         self._wkw_cache = self._user_layer_keywords(wall=True)
         self._save_elev_pref()
@@ -2844,19 +2847,24 @@ class ElevatorShaftReviewModule:
         self.parking_wall_layers = wall_layers
         self.parking_shaft_results = results
         self._refresh_parking_tree()
-        if not results or not wall_layers:
-            # 자동 탐색(저장된 이름 → 형상)으로 못 찾았을 때만 레이어명을 직접 물어본다.
-            self._reset_progress(0)
+        n_miss = sum(1 for r in results if r.get('source') == 'symbol_bbox')
+        if not results or n_miss:
+            # 승강기를 못 찾았거나(레이어명 입력), 벽을 못 찾은 승강로가 하나라도 있으면(골조 레이어명 입력)
+            # 여기서 멈추고 한 번 물어본다. 취소하거나 이미 한 번 물었으면 그대로 진행한다.
             if failed:
+                self._reset_progress(0)
                 messagebox.showwarning('안내', '분석 중 오류가 발생했습니다.')
                 return
-            got = self._ask_layer_names(need_elev=not results)
-            if got is not None:
-                self.var_elev_kw.set(got[0])
-                self.var_wall_kw.set(got[1])
-                self._save_elev_pref()
-                self.parent.after(50, self._run_parking_analyze)
-                return
+            if not results or not self._wall_prompted:
+                self._reset_progress(0)
+                got = self._ask_layer_names(need_elev=not results, n_miss=n_miss)
+                if got is not None:
+                    self._wall_prompted = bool(results)
+                    self.var_elev_kw.set(got[0])
+                    self.var_wall_kw.set(got[1])
+                    self._save_elev_pref()
+                    self.parent.after(50, lambda: self._run_parking_analyze(retry=True))
+                    return
             if not results:
                 return
         self._apply_pct(100)
@@ -2902,6 +2910,7 @@ class ElevatorShaftReviewModule:
                          and not any(k.upper() in st['layer'].split('$')[-1].upper() for k in self._ukw_cache)]
             ranked = []
             ucands = []
+            auto_names = list(name_cands)
             wkw = list(self._wkw_cache)
             if wkw:     # 사용자가 지정한 골조 레이어명 단어가 들어간 레이어를 먼저 본다(없거나 못 감싸면 자동 판별)
                 ucands = [st['layer'] for st in stats
@@ -2930,6 +2939,15 @@ class ElevatorShaftReviewModule:
                                if sc >= 1 and (l in name_set or sc >= 0.3 * top_sc)][:6]
                 cand_layers.sort(key=lambda t: (_layer_priority(t[0]), -t[1]))
                 wall_layers = [l for l, _sc in cand_layers]
+                if ucands and any(l in ucands for l in wall_layers):
+                    # 지정한 레이어가 못 감싸는 승강로는 자동 판별 레이어로도 시도하도록 뒤에 덧붙인다.
+                    r2 = _rank_wall_layers(msp, clusters, list(dict.fromkeys(auto_names + geo_cands)))
+                    if r2:
+                        t2 = r2[0][1]
+                        extra = [(l, sc) for l, sc, _cv in r2
+                                 if sc >= 1 and l not in wall_layers and (l in auto_names or sc >= 0.3 * t2)][:6]
+                        extra.sort(key=lambda t: (_layer_priority(t[0]), -t[1]))
+                        wall_layers += [l for l, _sc in extra]
                 info['covered'] = len(set().union(*[cv for _l, _sc, cv in ranked if _l in wall_layers])) if wall_layers else 0
             else:
                 wall_layers = list(info['ai_layers'])
