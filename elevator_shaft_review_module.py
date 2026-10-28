@@ -933,6 +933,29 @@ def _linkable(c1, c2):
     return _same_door(c1, c2) and _rect_gap(c1, c2) <= PARALLEL_MAX_GAP_MM
 
 
+def _x_rects_from_segs(segs, min_len=1500.0, size_lo=1000.0, size_hi=7000.0, cell=200.0):
+    """선분 목록에서 승강기 X자(중점 교차·같은 길이) 사각형을 모두 찾는다(격자 인덱스, 중심 200mm 이내 중복 제거)."""
+    segs = [sg for sg in segs if math.hypot(sg[2] - sg[0], sg[3] - sg[1]) >= min_len]
+    grid = defaultdict(list)
+    for i, sg in enumerate(segs):
+        grid[(int(((sg[0] + sg[2]) / 2) // cell), int(((sg[1] + sg[3]) / 2) // cell))].append(i)
+    rects = []
+    for i, a in enumerate(segs):
+        gx, gy = int(((a[0] + a[2]) / 2) // cell), int(((a[1] + a[3]) / 2) // cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in grid.get((gx + dx, gy + dy), ()):
+                    if j <= i:
+                        continue
+                    for cand in _x_candidates([a, segs[j]], min_len):
+                        r = _x_rect_of(cand)
+                        if size_lo <= r['width'] <= size_hi and size_lo <= r['height'] <= size_hi:
+                            if not any(math.hypot(r['center'][0] - q['center'][0], r['center'][1] - q['center'][1]) < 200.0
+                                       for q in rects):
+                                rects.append(r)
+    return rects
+
+
 def _geometry_x_fallback(msp, hidden, max_block_depth=6):
     """레이어/블록 이름 단서로 승강기를 하나도 못 찾았을 때의 보완 — 이름과 무관하게 '형상'으로 찾는다.
     도면 전체에서 긴 선(1800~9000mm)을 모아, 중점에서 교차하는 같은 길이의 두 선(승강기 X자 대각선)을 찾고,
@@ -986,26 +1009,7 @@ def _geometry_x_fallback(msp, hidden, max_block_depth=6):
     _iter(msp, 0, [], _collect_long)
     if len(long_segs) < 2:
         return []
-    cell = 200.0
-    grid = defaultdict(list)
-    for i, sg in enumerate(long_segs):
-        grid[(int(((sg[0] + sg[2]) / 2) // cell), int(((sg[1] + sg[3]) / 2) // cell))].append(i)
-    rects = []
-    for i, a in enumerate(long_segs):
-        ma = ((a[0] + a[2]) / 2, (a[1] + a[3]) / 2)
-        la = math.hypot(a[2] - a[0], a[3] - a[1])
-        gx, gy = int(ma[0] // cell), int(ma[1] // cell)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for j in grid.get((gx + dx, gy + dy), ()):
-                    if j <= i:
-                        continue
-                    for cand in _x_candidates([a, long_segs[j]], 1800.0):
-                        r = _x_rect_of(cand)
-                        if 1300.0 <= r['width'] <= 7000.0 and 1300.0 <= r['height'] <= 7000.0:
-                            if not any(math.hypot(r['center'][0] - q['center'][0], r['center'][1] - q['center'][1]) < 200.0
-                                       for q in rects):
-                                rects.append(r)
+    rects = _x_rects_from_segs(long_segs, 1800.0, size_lo=1300.0)
     if not rects:
         return []
     boxes = []
@@ -1170,6 +1174,27 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
     parent = list(range(n))
     root_bbox = {i: (found[i][2], found[i][3], found[i][4], found[i][5]) for i in range(n)}
 
+    # 서로 다른 승강기 X자 심볼에 속한 조각끼리는 절대 하나로 묶지 않는다 — 승강기가 960mm 안팎으로 붙어 있으면
+    # 한 승강기의 문틀/카운터웨이트 조각이 이웃 승강기 쪽에 먼저 합쳐져 이웃이 쪼개지거나 사라질 수 있다.
+    try:
+        xr_all = _x_rects_from_segs([sg for f_ in found for sg in f_[7]], 1500.0)
+    except Exception:
+        xr_all = []
+    sym_tag = {}
+    if len(xr_all) >= 2:
+        for i in range(n):
+            best = None
+            for k, r in enumerate(xr_all):
+                lx, ly = _rotate_point(found[i][0], found[i][1], -r['angle'], r['center'])
+                nx = abs(lx - r['center'][0]) / (r['width'] / 2.0)
+                ny = abs(ly - r['center'][1]) / (r['height'] / 2.0)
+                sc = max(nx, ny)
+                if sc <= 1.0 + 800.0 / max(min(r['width'], r['height']) / 2.0, 1.0) and (best is None or sc < best[0]):
+                    best = (sc, k)
+            if best:
+                sym_tag[i] = best[1]
+    root_tag = dict(sym_tag)
+
     def _find_root(x):
         while parent[x] != x:
             parent[x] = parent[parent[x]]
@@ -1199,6 +1224,10 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
         ri, rj = _find_root(i), _find_root(j)
         if ri == rj:
             continue
+        ta, tb = root_tag.get(ri), root_tag.get(rj)
+        if ta is not None and tb is not None and ta != tb:
+            adjacency_entity_pairs.append((i, j))
+            continue          # 서로 다른 승강기 심볼 — 묶지 않고 인접(병렬 후보)으로만 기록
         bi, bj = root_bbox[ri], root_bbox[rj]
         merged = (min(bi[0], bj[0]), min(bi[1], bj[1]), max(bi[2], bj[2]), max(bi[3], bj[3]))
         mw, mh = merged[2] - merged[0], merged[3] - merged[1]
@@ -1207,6 +1236,8 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             continue  # 병합하면 승강로 한 칸 크기를 넘어섬 — 서로 다른 승강로로 간주, 묶지 않음
         parent[ri] = rj
         root_bbox[rj] = merged
+        if ta is not None or tb is not None:
+            root_tag[rj] = ta if ta is not None else tb
 
     groups = {}
     for i in range(n):
