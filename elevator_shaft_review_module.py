@@ -277,7 +277,7 @@ def _structural_layer_names(stats):
 
 
 def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
-                       near_out_mm: float = 600.0, min_cover: float = 0.35, debug=None):
+                       near_out_mm: float = 600.0, min_cover: float = 0.35, debug=None, keep_hug=()):
     """후보 레이어마다 '승강로 심볼을 실제로 둘러싸는 정도'를 기하로 점수화한다 — 점수 = 심볼 4변 중
     3변 이상에, 심볼 가장자리 바깥(또는 25% 안쪽)~near_out_mm 이내로 그 변 길이의 min_cover 이상을 덮는
     선이 있는 승강로 수. 이름이나 AI 나열 순서가 아니라 도면 기하로 구조체 레이어를 고른다.
@@ -400,7 +400,7 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
         debug.extend((l, scores[l], hug[l]) for l in scores)
     # 대부분의 승강로에서 차실 윤곽에 밀착한 레이어는 벽이 아니라 승강기 도면 자체이므로 제외
     for layer in list(scores):
-        if hug[layer] >= 0.6 * scores[layer] and _layer_priority(layer) >= 2:
+        if hug[layer] >= 0.6 * scores[layer] and _layer_priority(layer) >= 2 and layer not in keep_hug:
             del scores[layer]
     return [(layer, sc, covered[layer]) for layer, sc in sorted(scores.items(), key=lambda kv: -kv[1])]
 
@@ -1074,7 +1074,7 @@ def _elevator_block_names(doc):
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
                                  size_min_mm: float = 1300.0, size_max_mm: float = 7000.0,
                                  cluster_dist_mm: float = 4000.0, merge_bbox_cap_mm: float = 4500.0,
-                                 max_block_depth: int = 6):
+                                 max_block_depth: int = 6, use_auto: bool = True):
     """dxf_path 전체(모델스페이스 + 중첩 블록)에서 레이어명에 layer_keywords 중
     하나라도 포함된 LINE/LWPOLYLINE/ARC 개체를 모아 월드 좌표 기준으로 가까운
     것끼리 묶는다.
@@ -1113,13 +1113,13 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
 
     kws = [k.upper() for k in layer_keywords]
     hidden = _hidden_layer_names(doc)
-    elev_blocks = _elevator_block_names(doc)
+    elev_blocks = _elevator_block_names(doc) if use_auto else set()
 
     def _layer_matches(layer_name):
         if layer_name in hidden:
             return False
         up = (layer_name or '').upper()
-        return any(k in up for k in kws) or _has_elev_token(layer_name)
+        return any(k in up for k in kws) or (use_auto and _has_elev_token(layer_name))
 
     def _entity_points(e):
         t = e.dxftype()
@@ -1177,7 +1177,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                     continue
 
     _walk(msp, 0, [])
-    if not found:
+    if not found and use_auto:
         # 이름 단서로 하나도 못 찾았으면 X자 대각선 '형상'으로 보완 탐지한다.
         try:
             found = _geometry_x_fallback(msp, hidden, max_block_depth)
@@ -2423,6 +2423,8 @@ class ElevatorShaftReviewModule:
         # 단계에서 틀어지는지(심볼 탐지 자체가 안 되는지/벽 레이어 판별이
         # 틀렸는지/스냅이 안 되는지) 단계마다 결과를 보고 다음 단계로 넘어갈
         # 수 있게 한다.
+        self._ukw_cache = []
+        self._wkw_cache = []
         self.parking_source_path = None
         self.parking_clusters = []       # ① 심볼 위치 탐지 결과(벽 스냅 전, bbox만)
         self.parking_wall_layers = []    # ② AI가 판별한 벽체 레이어명 목록
@@ -2437,6 +2439,32 @@ class ElevatorShaftReviewModule:
         # 이 값이 있으면 상단에 현재 프로젝트명을 표시해 여러 동을 계속 같은
         # 프로젝트에 누적하고 있는지 헷갈리지 않게 한다.
         self.current_project_name = None
+
+    # ── 승강기 레이어명 단어(사용자 입력) ───────────────────────
+    def _elev_pref_path(self):
+        return os.path.join(_user_data_dir(), '.elev_prefs.json')
+
+    def _load_elev_pref(self, key='elev_layer'):
+        try:
+            with open(self._elev_pref_path(), 'r', encoding='utf-8') as f:
+                return str(json.load(f).get(key, ''))
+        except Exception:
+            return ''
+
+    def _save_elev_pref(self):
+        try:
+            with open(self._elev_pref_path(), 'w', encoding='utf-8') as f:
+                json.dump({'elev_layer': self.var_elev_kw.get().strip(), 'wall_layer': self.var_wall_kw.get().strip()},
+                          f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _user_layer_keywords(self, wall=False):
+        try:
+            raw = (self.var_wall_kw if wall else self.var_elev_kw).get()
+        except Exception:
+            return []
+        return [t.strip() for t in re.split(r'[,;\s]+', raw or '') if t.strip()]
 
     # ── 공통 API 키/모델 조회 ──────────────────────────────────
     def _get_api(self):
@@ -2567,6 +2595,16 @@ class ElevatorShaftReviewModule:
                                             text_color=BTN_METAL_TEXT_PRIMARY, bold=True)
         self.btn_analyze.pack(side='left', padx=(10, 0))
         self.btn_analyze.config(state='disabled')
+        tk.Label(btn_row, text='승강기 레이어', font=FS, bg=SURFACE, fg=TEXT_SECONDARY).pack(side='left', padx=(18, 4))
+        self.var_elev_kw = tk.StringVar(value=self._load_elev_pref('elev_layer'))
+        ent = tk.Entry(btn_row, textvariable=self.var_elev_kw, width=26, font=FS, relief='solid', bd=1)
+        ent.pack(side='left')
+        ent.bind('<FocusOut>', lambda _e: self._save_elev_pref())
+        tk.Label(btn_row, text='승강로 골조 레이어', font=FS, bg=SURFACE, fg=TEXT_SECONDARY).pack(side='left', padx=(18, 4))
+        self.var_wall_kw = tk.StringVar(value=self._load_elev_pref('wall_layer'))
+        ent2 = tk.Entry(btn_row, textvariable=self.var_wall_kw, width=26, font=FS, relief='solid', bd=1)
+        ent2.pack(side='left')
+        ent2.bind('<FocusOut>', lambda _e: self._save_elev_pref())
 
         self.lbl_dxf_file = tk.Label(card, text='불러온 도면: 없음', font=FS, bg=SURFACE, fg=TEXT_MUTED,
                                       anchor='w', justify='left')
@@ -2766,6 +2804,9 @@ class ElevatorShaftReviewModule:
             if not self._run_parking_load_dxf():
                 return
             path = self.parking_source_path
+        self._ukw_cache = self._user_layer_keywords()
+        self._wkw_cache = self._user_layer_keywords(wall=True)
+        self._save_elev_pref()
         api = ('', '', '')     # 분석은 도면 기하만 사용한다(네트워크/API 불필요)
         self._reset_parking_state()
         for b in (self.btn_load_dxf, self.btn_analyze):
@@ -2777,7 +2818,12 @@ class ElevatorShaftReviewModule:
         clusters, wall_layers, results, failed = [], [], [], False
         try:
             self._set_pct(2)
-            clusters = _find_shaft_points_by_layer(path, layer_keywords=SHAFT_LAYER_KEYWORDS)
+            ukw = list(self._ukw_cache)
+            clusters = []
+            if ukw:     # 사용자가 지정한 레이어명 단어가 있으면 그 단어가 들어간 레이어만 먼저 본다
+                clusters = _find_shaft_points_by_layer(path, layer_keywords=ukw, use_auto=False)
+            if not clusters:
+                clusters = _find_shaft_points_by_layer(path, layer_keywords=SHAFT_LAYER_KEYWORDS)
             self._set_pct(15)
             if clusters:
                 wall_layers, _summary, _info = self._analyze_walls(path, clusters, api_key, model, provider)
@@ -2840,9 +2886,21 @@ class ElevatorShaftReviewModule:
                          if st['count'] >= 8 and not any(t.upper() in st['layer'].split('$')[-1].upper() for t in
                                                           ('CEN', 'GRID', '중심선', '그리드', 'DIM', '치수', 'TEXT', '주차',
                                                            'DEFPOINT', 'ELEV', '승강'))
-                         and not _has_elev_token(st['layer'])]
-            cands = list(dict.fromkeys(name_cands + geo_cands))
-            ranked = _rank_wall_layers(msp, clusters, cands)
+                         and not _has_elev_token(st['layer'])
+                         and not any(k.upper() in st['layer'].split('$')[-1].upper() for k in self._ukw_cache)]
+            ranked = []
+            ucands = []
+            wkw = list(self._wkw_cache)
+            if wkw:     # 사용자가 지정한 골조 레이어명 단어가 들어간 레이어를 먼저 본다(없거나 못 감싸면 자동 판별)
+                ucands = [st['layer'] for st in stats
+                          if any(k.upper() in st['layer'].split('$')[-1].upper() for k in wkw)]
+                if ucands:
+                    ranked = _rank_wall_layers(msp, clusters, ucands, keep_hug=set(ucands))
+            if ranked:
+                name_cands = list(ucands)
+            else:
+                cands = list(dict.fromkeys(name_cands + geo_cands))
+                ranked = _rank_wall_layers(msp, clusters, cands)
             self._set_pct(45)
             info['scores'] = [(l, sc) for l, sc, _cv in ranked]
             if ranked:
