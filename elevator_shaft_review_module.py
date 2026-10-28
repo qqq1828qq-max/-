@@ -1038,37 +1038,14 @@ def _geometry_x_fallback(msp, hidden, max_block_depth=6):
     return found
 
 
-_ELEV_BLOCK_RE = re.compile(r'\d{3,4}\s*[Xx×*]\s*\d{3,4}.*(인승|인용)|(인승|인용)')
+_ELEV_BLOCK_RE = re.compile(r'\d{3,4}\s*[Xx×*]\s*\d{3,4}.*인승')
 
 
 def _elevator_block_names(doc):
-    """승강기 심볼 블록 이름 집합 — 레이어가 '0'처럼 아무 단서가 없어도 블록 자체로 찾는다.
-    (a) 블록 이름이 'ELEV/승강/엘리베이터' 토큰이거나 '2500X2550_18인승' 형태이거나,
-    (b) 블록 안에 승강기 X자 대각선(대각선 1800mm 이상)이 있으면 승강기 블록으로 본다."""
-    names = set()
-    for blk in doc.blocks:
-        nm = blk.name
-        if nm.startswith('*'):
-            continue
-        if _has_elev_token(nm) or _ELEV_BLOCK_RE.search(nm):
-            names.add(nm)
-            continue
-        segs = []
-        try:
-            for e in blk:
-                t = e.dxftype()
-                if t == 'LINE':
-                    segs.append((e.dxf.start.x, e.dxf.start.y, e.dxf.end.x, e.dxf.end.y))
-                elif t == 'LWPOLYLINE':
-                    pts = [(q[0], q[1]) for q in e.get_points('xy')]
-                    segs += [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]) for k in range(len(pts) - 1)]
-                if len(segs) > 400:
-                    break
-        except Exception:
-            continue
-        if segs and _x_candidates(segs, 1800.0):
-            names.add(nm)
-    return names
+    """'2500X2550_18인승' 형태의 이름을 가진 승강기 심볼 블록 — 블록 안 선의 레이어가 '0'처럼 단서가 없어도
+    블록 자체로 찾는다. (이름 단서가 더 느슨하면 장애인용 소변기 같은 블록이 잡혀 오탐이 난다)"""
+    return {blk.name for blk in doc.blocks
+            if not blk.name.startswith('*') and _ELEV_BLOCK_RE.search(blk.name.split('$')[-1])}
 
 
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
