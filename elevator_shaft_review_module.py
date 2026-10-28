@@ -400,7 +400,7 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
         debug.extend((l, scores[l], hug[l]) for l in scores)
     # 대부분의 승강로에서 차실 윤곽에 밀착한 레이어는 벽이 아니라 승강기 도면 자체이므로 제외
     for layer in list(scores):
-        if hug[layer] >= 0.6 * scores[layer]:
+        if hug[layer] >= 0.6 * scores[layer] and _layer_priority(layer) >= 2:
             del scores[layer]
     return [(layer, sc, covered[layer]) for layer, sc in sorted(scores.items(), key=lambda kv: -kv[1])]
 
@@ -895,7 +895,7 @@ def _same_door(c1, c2, min_dot: float = 0.9):
 # 줄여 쓴 승강기 레이어명('A-el', 'A-EV', 'E-ELV' 등)을 위한 토큰 규칙 — 레이어명을 '-', '_', '$', 공백 등으로
 # 쪼갠 토큰 하나가 정확히 아래 값이거나 'ELEV'로 시작하면 승강기 레이어로 본다. 부분일치가 아니라
 # 토큰 일치라서 'LEVEL'/'REVISION'/'DEVELOP' 같은 무관한 이름에는 걸리지 않는다.
-_ELEV_TOKENS = {'EL', 'EV', 'ELV', 'LIFT', 'ELEVATOR', 'ELEVATORS', 'EVT', 'E.V'}
+_ELEV_TOKENS = {'EL', 'EV', 'ELV', 'LIFT', 'ELEVATOR', 'ELEVATORS', 'EVT', 'EVTR', 'E.V'}
 
 
 def _has_elev_token(layer_name):
@@ -931,6 +931,39 @@ def _rect_gap(c1, c2):
 def _linkable(c1, c2):
     """병렬 코어로 묶을 수 있는 두 승강기인지: 문 방향이 같고 차실 사이 거리가 PARALLEL_MAX_GAP_MM 이내."""
     return _same_door(c1, c2) and _rect_gap(c1, c2) <= PARALLEL_MAX_GAP_MM
+
+
+_ELEV_BLOCK_RE = re.compile(r'\d{3,4}\s*[Xx×*]\s*\d{3,4}.*(인승|인용)|(인승|인용)')
+
+
+def _elevator_block_names(doc):
+    """승강기 심볼 블록 이름 집합 — 레이어가 '0'처럼 아무 단서가 없어도 블록 자체로 찾는다.
+    (a) 블록 이름이 'ELEV/승강/엘리베이터' 토큰이거나 '2500X2550_18인승' 형태이거나,
+    (b) 블록 안에 승강기 X자 대각선(대각선 1800mm 이상)이 있으면 승강기 블록으로 본다."""
+    names = set()
+    for blk in doc.blocks:
+        nm = blk.name
+        if nm.startswith('*'):
+            continue
+        if _has_elev_token(nm) or _ELEV_BLOCK_RE.search(nm):
+            names.add(nm)
+            continue
+        segs = []
+        try:
+            for e in blk:
+                t = e.dxftype()
+                if t == 'LINE':
+                    segs.append((e.dxf.start.x, e.dxf.start.y, e.dxf.end.x, e.dxf.end.y))
+                elif t == 'LWPOLYLINE':
+                    pts = [(q[0], q[1]) for q in e.get_points('xy')]
+                    segs += [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]) for k in range(len(pts) - 1)]
+                if len(segs) > 400:
+                    break
+        except Exception:
+            continue
+        if segs and _x_candidates(segs, 1800.0):
+            names.add(nm)
+    return names
 
 
 def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWORDS,
@@ -975,6 +1008,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
 
     kws = [k.upper() for k in layer_keywords]
     hidden = _hidden_layer_names(doc)
+    elev_blocks = _elevator_block_names(doc)
 
     def _layer_matches(layer_name):
         if layer_name in hidden:
@@ -999,7 +1033,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
 
     found = []  # (centroid_x, centroid_y, x0,y0,x1,y1, pts, segs)
 
-    def _walk(entities, depth, clip_stack):
+    def _walk(entities, depth, clip_stack, force=False):
         for e in entities:
             try:
                 etype = e.dxftype()
@@ -1012,7 +1046,7 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                     layer = ''
                 # ④가 만든 결과 레이어('승강로 사이즈')는 레이어명에 '승강'이 들어 있어
                 # 결과 DXF를 다시 입력하면 심볼로 오인되므로 제외한다.
-                if layer != '승강로 사이즈' and _layer_matches(layer):
+                if layer != '승강로 사이즈' and (_layer_matches(layer) or (force and layer not in hidden)):
                     pts = _entity_points(e)
                     if pts:
                         cx = sum(p[0] for p in pts) / len(pts)
@@ -1031,8 +1065,9 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
             elif etype == 'INSERT' and depth < max_block_depth and not _insert_hidden(e, hidden):
                 clip_poly = _active_xclip_polygon_world(e)
                 new_stack = clip_stack + [clip_poly] if clip_poly else clip_stack
+                is_elev_blk = force or e.dxf.name in elev_blocks
                 try:
-                    _walk(e.virtual_entities(), depth + 1, new_stack)
+                    _walk(e.virtual_entities(), depth + 1, new_stack, is_elev_blk)
                 except Exception:
                     continue
 
