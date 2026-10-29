@@ -58,6 +58,10 @@ _SHAFT_LAYER_LINEWEIGHT = 200
 # ──────────────────────────────────────────────────────────────
 #  DXF 유틸 (지연 import — ezdxf는 실제 필요할 때만 로드)
 # ──────────────────────────────────────────────────────────────
+class _InvertedClip(list):
+    """반전(Invert) XCLIP — 경계 '안쪽'이 숨겨지고 바깥쪽이 보인다."""
+
+
 def _active_xclip_polygon_world(insert_entity):
     """INSERT에 "활성화된"(XCLIP으로 켜져 있는) 클리핑 경계가 있으면 월드 좌표계
     다각형(점 리스트)을 반환하고, 없으면 None을 반환한다.
@@ -77,7 +81,9 @@ def _active_xclip_polygon_world(insert_entity):
         path = clip.get_wcs_clipping_path()
         verts = path.inner_polygon() if path.is_inverted_clip else path.vertices
         pts = [(v.x, v.y) for v in verts]
-        return pts if len(pts) >= 3 else None
+        if len(pts) < 3:
+            return None
+        return _InvertedClip(pts) if path.is_inverted_clip else pts
     except Exception:
         return None
 
@@ -95,7 +101,8 @@ def _point_in_clip_stack(pt, clip_stack):
     p = Vec2(pt[0], pt[1])
     for poly in clip_stack:
         try:
-            if is_point_in_polygon_2d(p, [Vec2(x, y) for x, y in poly]) < 0:
+            inside = is_point_in_polygon_2d(p, [Vec2(x, y) for x, y in poly]) >= 0
+            if inside == isinstance(poly, _InvertedClip):
                 return False
         except Exception:
             continue
