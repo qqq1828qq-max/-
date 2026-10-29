@@ -282,7 +282,15 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
     선이 있는 승강로 수. 이름이나 AI 나열 순서가 아니라 도면 기하로 구조체 레이어를 고른다.
     반환: [(layer, score, 덮는 승강로 index 집합)] 점수 내림차순."""
     hidden = _hidden_layer_names(msp.doc)
-    cand = set(candidates) - hidden
+    # 'A|B'처럼 '|'로 이은 후보는 여러 레이어를 합친 벽선 집합(한 승강로의 벽이 여러 레이어에 나뉜 경우)으로 점수화한다.
+    combo_of = defaultdict(list)
+    real = set()
+    for c_ in candidates:
+        for part in c_.split('|'):
+            real.add(part)
+            if '|' in c_:
+                combo_of[part].append(c_)
+    cand = real - hidden
     if not cand or not clusters:
         return []
     info = []
@@ -294,6 +302,7 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
     hits = defaultdict(list)     # (layer, ci) -> [(orient, pos, lo, hi)]
 
     def _add(layer, pts):
+        keys = [layer] + combo_of.get(layer, [])
         for k in range(len(pts) - 1):
             ax, ay = pts[k]; bx, by = pts[k + 1]
             if math.hypot(bx - ax, by - ay) < 300.0:
@@ -308,9 +317,11 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
                     continue
                 a = math.degrees(math.atan2(abs(y1 - y0), abs(x1 - x0)))
                 if a >= 85:
-                    hits[(layer, ci)].append(('v', (x0 + x1) / 2, min(y0, y1), max(y0, y1)))
+                    for key_ in keys:
+                        hits[(key_, ci)].append(('v', (x0 + x1) / 2, min(y0, y1), max(y0, y1)))
                 elif a <= 5:
-                    hits[(layer, ci)].append(('h', (y0 + y1) / 2, min(x0, x1), max(x0, x1)))
+                    for key_ in keys:
+                        hits[(key_, ci)].append(('h', (y0 + y1) / 2, min(x0, x1), max(x0, x1)))
 
     def _walk(entities, depth, clip_stack):
         for e in entities:
@@ -2233,19 +2244,21 @@ class ElevatorShaftReviewModule:
         dlg.resizable(False, False)
         out = {'v': None}
         msg = ('승강로를 찾지 못했습니다.' if need_elev else f'벽(골조)을 찾지 못한 승강로가 {n_miss}곳 있습니다.') + \
-              '\n도면의 레이어명(일부 단어)을 입력하세요. 여러 개는 쉼표로 구분합니다.'
+              '\n도면의 레이어명(일부 단어 가능)을 입력하세요.\n여러 개는 한 줄에 하나씩 또는 쉼표(,)로 구분해 입력합니다.'
         tk.Label(dlg, text=msg, justify='left', padx=16, pady=10).grid(row=0, column=0, columnspan=2, sticky='w')
         tk.Label(dlg, text='승강기 레이어').grid(row=1, column=0, sticky='e', padx=(16, 6), pady=4)
-        e1 = tk.Entry(dlg, width=30)
+        e1 = tk.Text(dlg, width=32, height=3, wrap='word')
         e1.grid(row=1, column=1, padx=(0, 16))
-        e1.insert(0, self.var_elev_kw.get())
+        e1.insert('1.0', self.var_elev_kw.get())
         tk.Label(dlg, text='승강로 골조 레이어').grid(row=2, column=0, sticky='e', padx=(16, 6), pady=4)
-        e2 = tk.Entry(dlg, width=30)
+        e2 = tk.Text(dlg, width=32, height=3, wrap='word')
         e2.grid(row=2, column=1, padx=(0, 16))
-        e2.insert(0, self.var_wall_kw.get())
+        e2.insert('1.0', self.var_wall_kw.get())
 
         def ok():
-            out['v'] = (e1.get().strip(), e2.get().strip())
+            def _norm(w):
+                return ', '.join(t.strip() for t in re.split(r'[,;\n]+', w.get('1.0', 'end')) if t.strip())
+            out['v'] = (_norm(e1), _norm(e2))
             dlg.destroy()
 
         row = tk.Frame(dlg)
@@ -2262,7 +2275,7 @@ class ElevatorShaftReviewModule:
             raw = (self.var_wall_kw if wall else self.var_elev_kw).get()
         except Exception:
             return []
-        return [t.strip() for t in re.split(r'[,;\s]+', raw or '') if t.strip()]
+        return [t.strip() for t in re.split(r'[,;\n]+', raw or '') if t.strip()]
 
     # ── 공통 API 키/모델 조회 ──────────────────────────────────
     # ── 카드 헬퍼 (허브 스타일과 동일) ─────────────────────────
@@ -2645,6 +2658,8 @@ class ElevatorShaftReviewModule:
             if wkw:     # 사용자가 지정한 골조 레이어명 단어가 들어간 레이어를 먼저 본다(없거나 못 감싸면 자동 판별)
                 ucands = [st['layer'] for st in stats
                           if any(k.upper() in st['layer'].split('$')[-1].upper() for k in wkw)]
+                if len(ucands) >= 2:
+                    ucands = ucands + ['|'.join(ucands)]     # 여러 레이어를 합친 벽선 집합도 후보로
                 if ucands:
                     ranked = _rank_wall_layers(msp, clusters, ucands, keep_hug=set(ucands))
             if ranked:
@@ -2666,7 +2681,7 @@ class ElevatorShaftReviewModule:
                 # 이름 단서가 있는 후보는 점수 1 이상이면, 이름 단서가 없는 후보(짧은 이름 등)는 1위 점수의
                 # 30% 이상일 때만 채택해 우연히 승강로 근처를 지나는 잡선 레이어를 걸러낸다.
                 cand_layers = [(l, sc) for l, sc, _cv in ranked
-                               if sc >= 1 and (l in name_set or sc >= 0.3 * top_sc)][:6]
+                               if sc >= 1 and (l in name_set or sc >= 0.3 * top_sc)][:12 if ucands else 6]
                 cand_layers.sort(key=lambda t: (_layer_priority(t[0]), -t[1]))
                 wall_layers = [l for l, _sc in cand_layers]
                 if ucands and any(l in ucands for l in wall_layers):
