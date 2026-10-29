@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 set MISSING=0
-for %%F in (elevator_review_app.py elevator_shaft_review_module.py elevator_security.py designhub_ui_theme.py ai_client.py api_settings_module.py elevator_standards.py elevator_shaft_table.json) do (
+for %%F in (elevator_review_app.py elevator_shaft_review_module.py elevator_security.py designhub_ui_theme.py) do (
   if not exist "%%F" (echo [누락] %%F & set MISSING=1)
 )
 if "%MISSING%"=="1" (echo 위 파일을 이 폴더에 넣고 다시 실행하세요. & pause & exit /b 1)
@@ -18,10 +18,6 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
   --include-module=elevator_shaft_review_module ^
   --include-module=elevator_security ^
   --include-module=designhub_ui_theme ^
-  --include-module=ai_client ^
-  --include-module=api_settings_module ^
-  --include-module=elevator_standards ^
-  --include-data-files=elevator_shaft_table.json=elevator_shaft_table.json ^
   --output-filename=ElevatorReview.exe ^
   --output-dir=dist ^
   elevator_review_app.py

@@ -49,22 +49,6 @@ class ElevatorReviewApp(tk.Tk):
         except Exception:
             pass
 
-        # ★ API 설정 공유 딕셔너리 (승강기 검토 탭이 여기서 키를 읽음)
-        import ai_client as _ai_client
-        from ai_client import DEFAULT_MODEL as _DEFAULT_MODEL, DEFAULT_PROVIDER as _DEFAULT_PROVIDER
-        self.shared_api = {'api_key': '', 'model': _DEFAULT_MODEL, 'provider': _DEFAULT_PROVIDER}
-        try:
-            from api_settings_module import load_settings as _ls
-            _saved = _ls()
-            _provider = _saved['provider']
-            _entry = _saved['providers'].get(_provider, {'api_key': '', 'model': _DEFAULT_MODEL})
-            self.shared_api['provider'] = _provider
-            self.shared_api['api_key'] = _entry['api_key']
-            self.shared_api['model'] = _entry['model']
-            _ai_client.set_provider(_provider)
-        except Exception:
-            pass
-
         self._build_ui()
 
     # ──────────────────────────────────────────────────────────
@@ -149,8 +133,8 @@ class ElevatorReviewApp(tk.Tk):
 
         ctx_wrap = tk.Frame(topbar, bg=SURFACE_HEADER)
         ctx_wrap.place(x=28, y=0, relheight=1)
-        self.topbar_section_var = tk.StringVar(value='SYSTEM')
-        self.topbar_title_var = tk.StringVar(value='API 설정')
+        self.topbar_section_var = tk.StringVar(value='DESIGN')
+        self.topbar_title_var = tk.StringVar(value='승강로 CAD 도면 분석')
         tk.Label(ctx_wrap, textvariable=self.topbar_section_var,
                  font=(_F_LATIN, 8, 'bold'), bg=SURFACE_HEADER, fg=ACCENT_PRIMARY).pack(anchor='w', pady=(13, 0))
         tk.Label(ctx_wrap, textvariable=self.topbar_title_var,
@@ -183,9 +167,8 @@ class ElevatorReviewApp(tk.Tk):
             self._show_error_ui(parent, ui_name, str(e))
 
     def _create_tabs(self):
-        """사이드바 네비게이션 — API 설정 + 승강로 CAD 도면 분석, 딱 2개만."""
+        """사이드바 네비게이션."""
         tab_defs = [
-            ('api', '00', 'API 설정', 'API Settings', 'SYSTEM', self._build_api_tab),
             ('elevator', '01', '승강로 CAD 도면 분석', 'Elevator Shaft Size Review', 'DESIGN', self._build_elevator_tab),
         ]
 
@@ -231,8 +214,7 @@ class ElevatorReviewApp(tk.Tk):
                 w.bind('<Enter>', lambda _e, k=key: self._on_nav_hover(k, True))
                 w.bind('<Leave>', lambda _e, k=key: self._on_nav_hover(k, False))
 
-        _first = 'elevator' if self.shared_api.get('api_key') else 'api'
-        self._show_tab(_first)
+        self._show_tab('elevator')
 
     def _on_nav_hover(self, key, entering):
         item = self._nav_items.get(key)
@@ -274,18 +256,8 @@ class ElevatorReviewApp(tk.Tk):
                     messagebox.showerror("탭 로드 오류", f"탭을 로드하는 중 오류가 발생했습니다:\n{str(e)}")
 
     # ──────────────────────────────────────────────────────────
-    #  탭 빌더 — API 설정 / 승강로 CAD 도면 분석
+    #  탭 빌더 — 승강로 CAD 도면 분석
     # ──────────────────────────────────────────────────────────
-    def _build_api_tab(self, parent):
-        """API 설정 탭 — API 키 중앙 관리"""
-        try:
-            from api_settings_module import APISettingsModule
-            self.api_settings_module = APISettingsModule(parent, self)
-            self.api_settings_module.build_ui()
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self._show_error_ui(parent, 'API 설정', str(e))
-
     def _build_elevator_tab(self, parent):
         """01 승강로 CAD 도면 분석 탭 — 평면도/입면도 실측 치수 vs 제조사별 기준 자동 판정"""
         self._load_tab_module(

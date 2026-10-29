@@ -33,7 +33,6 @@ from designhub_ui_theme import (
     configure_designhub_ttk_styles,
 )
 
-import ai_client
 
 # 인승(정원) 콤보박스에 쓰이는 흔한 값 목록 — 예전에는 이 값이 제조사/당사 규격표
 # (vendor_standards.py/elevator_standards.py)와 맞물려 있었지만, 이 탭은 이제
@@ -1484,32 +1483,6 @@ def _collect_layer_line_stats(dxf_path: str, max_block_depth: int = 6):
     return out
 
 
-WALL_LAYER_AI_PROMPT_TEMPLATE = """당신은 건축 CAD 도면의 레이어 구성을 분석하는 보조원입니다.
-아래는 DXF 도면 하나에 있는 레이어 목록이며, 각 레이어에 그려진 직선/폴리선의
-개수와 총 길이(미터)를 함께 보여줍니다(이 도면 전체를 한 번 순회해 집계한
-실측값입니다).
-
-레이어명은 설계사(회사)마다 전혀 다른 규칙을 씁니다 — 예: "골조", "G-WAL",
-"A-Wall", "CON", "G-CON", "WAL-H", "0-Def-기준Wall", "벽체" 등이 모두 "건물
-구조체(콘크리트) 벽/기둥"을 의미할 수 있습니다. 반대로 총 길이가 길어도 벽이
-아닌 레이어도 많습니다 — 예: 주차선/가이드선, 중심선(CEN/GRID), 치수선,
-마감재(피니시), 전기차 충전구역 표시, 장애인 주차구역 표시 등.
-
-레이어 목록(총길이 내림차순):
-{layer_lines}
-
-과제: 이 중 승강기 승강로(엘리베이터 샤프트)를 둘러싼 "구조체 콘크리트
-벽/기둥"을 나타낼 가능성이 높은 레이어를 모두 골라, 가능성이 높은 순서로
-정렬해 답하세요. 레이어명에 "골조/WALL/WAL/CON/벽체/기둥/구조" 같은 단서가
-있으면 유력하지만, 단서가 없어도 통계상 벽체스러우면 후보에 넣을 수 있습니다.
-확신이 없으면 여러 개를 후보로 제시해도 됩니다(호출하는 쪽에서 순서대로
-시도합니다). 주차선/중심선/그리드/치수선/마감재/설비 레이어는 제외하세요.
-
-반드시 JSON으로만 답하세요(설명 문장 금지):
-{{"wall_layers": ["레이어명1", "레이어명2", ...], "reason": "간단한 판단 근거"}}
-레이어명은 위 목록에 있는 것과 정확히 똑같은 문자열이어야 합니다."""
-
-
 _CAPACITY_TEXT_RE = re.compile(r'(\d{1,3})\s*인승')
 
 
@@ -1686,133 +1659,6 @@ def _line_coverage(line, lo, hi):
         return 0.0
     cov = sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in line['spans'])
     return cov / (hi - lo)
-
-
-def _validate_parallel_fix(raw_shafts, member_local, verticals, horizontals,
-                            snap_tol=30.0, size_range=(1500.0, 4500.0), min_cover=0.5):
-    """AI가 고른 칸별 사각형을 검증한다. member_local: {id: (cx, cy)} 로컬 중심.
-    통과하면 {id: (x0,x1,y0,y1)}(목록의 실제 벽선 좌표로 보정됨), 하나라도 어긋나면 None."""
-    def _nearest(val, lines):
-        best = None
-        for ln in lines:
-            d = abs(ln['pos'] - val)
-            if d <= snap_tol and (best is None or d < best[0]):
-                best = (d, ln)
-        return best[1] if best else None
-
-    if not isinstance(raw_shafts, list):
-        return None
-    rects = {}
-    for s in raw_shafts:
-        try:
-            sid = int(s['id'])
-            vals = [float(s[k]) for k in ('x0', 'x1', 'y0', 'y1')]
-        except Exception:
-            return None
-        if sid not in member_local or sid in rects:
-            return None
-        lx0, lx1 = _nearest(vals[0], verticals), _nearest(vals[1], verticals)
-        ly0, ly1 = _nearest(vals[2], horizontals), _nearest(vals[3], horizontals)
-        if not (lx0 and lx1 and ly0 and ly1):
-            return None  # 목록에 없는 좌표 — AI가 지어낸 값
-        x0, x1 = sorted((lx0['pos'], lx1['pos']))
-        y0, y1 = sorted((ly0['pos'], ly1['pos']))
-        w, d = x1 - x0, y1 - y0
-        if not (size_range[0] <= w <= size_range[1] and size_range[0] <= d <= size_range[1]):
-            return None
-        cx, cy = member_local[sid]
-        if not (x0 <= cx <= x1 and y0 <= cy <= y1):
-            return None
-        # 선택한 좌우/상하 벽선이 실제로 칸 길이의 절반 이상을 덮어야 한다.
-        for ln, lo, hi in ((lx0, y0, y1), (lx1, y0, y1), (ly0, x0, x1), (ly1, x0, x1)):
-            if _line_coverage(ln, lo, hi) < min_cover:
-                return None
-        rects[sid] = (x0, x1, y0, y1)
-    if set(rects) != set(member_local):
-        return None
-    ids = list(rects)
-    for i in range(len(ids)):
-        for j in range(i + 1, len(ids)):
-            a, b = rects[ids[i]], rects[ids[j]]
-            ox = min(a[1], b[1]) - max(a[0], b[0])
-            oy = min(a[3], b[3]) - max(a[2], b[2])
-            if ox > 50.0 and oy > 50.0:
-                return None  # 칸끼리 겹침 — 옆 칸을 통째로 포함한 경우
-    return rects
-
-
-def _ai_fix_parallel_group(segs, members, api_key, model, provider, max_lines=70):
-    """병렬 그룹(members: 클러스터 dict 리스트, 각각 'center'/'rotated_rect' 포함)의
-    칸별 안쪽 벽면 사각형을 AI+벡터 검증으로 구한다.
-    반환: {member 리스트 인덱스: {'points':[(x,y)x4], 'width_mm', 'depth_mm'}} 또는 None."""
-    if not segs or len(members) < 2 or not api_key:
-        return None
-    centers = [m['center'] for m in members]
-    gcx = sum(c[0] for c in centers) / len(centers)
-    gcy = sum(c[1] for c in centers) / len(centers)
-    x0s = [m['bbox'][0] for m in members]; x1s = [m['bbox'][2] for m in members]
-    y0s = [m['bbox'][1] for m in members]; y1s = [m['bbox'][3] for m in members]
-    extent = max(max(x1s) - min(x0s), max(y1s) - min(y0s))
-    angle = _dominant_wall_angle_deg(segs, (gcx, gcy), extent / 2 + 3500.0)
-    if abs(angle - 90.0) < 1.0:
-        angle = 0.0
-    origin = (gcx, gcy)
-
-    # 로컬 창: 그룹 전체 + 사방 여유(벽 두께·바깥벽 포함)
-    local_pts = [_rotate_point(px, py, -angle, origin) for px, py in
-                 [(x, y) for m in members for x, y in
-                  ((m['bbox'][0], m['bbox'][1]), (m['bbox'][2], m['bbox'][3]),
-                   (m['bbox'][0], m['bbox'][3]), (m['bbox'][2], m['bbox'][1]))]]
-    lx = [p[0] - gcx for p in local_pts]; ly = [p[1] - gcy for p in local_pts]
-    pad = 1500.0
-    window = (min(lx) - pad, min(ly) - pad, max(lx) + pad, max(ly) + pad)
-    verticals, horizontals = _local_wall_lines(segs, origin, angle, window)
-    if len(verticals) < 2 or len(horizontals) < 2:
-        return None
-
-    def _top(lines):
-        # 프롬프트 길이 제한: 구간 총 길이가 긴(=진짜 벽다운) 선 위주로 남기고 좌표순 정렬
-        lines = sorted(lines, key=lambda l: -sum(b - a for a, b in l['spans']))[:max_lines]
-        return sorted(lines, key=lambda l: l['pos'])
-
-    verticals, horizontals = _top(verticals), _top(horizontals)
-
-    member_local = {}
-    shaft_lines = []
-    for k, m in enumerate(members, start=1):
-        rx, ry = _rotate_point(m['center'][0], m['center'][1], -angle, origin)
-        member_local[k] = (rx - gcx, ry - gcy)
-        rr = m.get('rotated_rect') or {}
-        shaft_lines.append(f"- id {k}: 중심 ({member_local[k][0]:.0f}, {member_local[k][1]:.0f}), "
-                           f"심볼 윤곽 약 {rr.get('width_mm', 0):.0f}x{rr.get('height_mm', 0):.0f}")
-
-    def _fmt(lines, tag):
-        return '\n'.join(
-            f"{tag}={ln['pos']:.0f} | " + ', '.join(f"[{a:.0f}~{b:.0f}]" for a, b in ln['spans'][:4])
-            for ln in lines)
-
-    prompt = PARALLEL_FIX_PROMPT.format(
-        n=len(members), shaft_lines='\n'.join(shaft_lines),
-        v_lines=_fmt(verticals, 'x'), h_lines=_fmt(horizontals, 'y'))
-    try:
-        raw = ai_client.generate_text(
-            api_key, model, prompt, provider=provider,
-            response_format={'type': 'json_object'}, _context='ai_fix_parallel_group')
-        data = _extract_json(raw)
-    except Exception:
-        traceback.print_exc()
-        return None
-
-    rects = _validate_parallel_fix(data.get('shafts') if isinstance(data, dict) else None,
-                                   member_local, verticals, horizontals)
-    if not rects:
-        return None
-    out = {}
-    for k, (x0, x1, y0, y1) in rects.items():
-        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-        world = [_rotate_point(gcx + cx, gcy + cy, angle, origin) for cx, cy in corners]
-        out[k - 1] = {'points': world, 'width_mm': round(x1 - x0, 1), 'depth_mm': round(y1 - y0, 1)}
-    return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -2062,77 +1908,6 @@ def _bays_by_containment(frame):
     return out
 
 
-BAY_AI_PROMPT = """당신은 건축 평면도에서 승강기(엘리베이터) 배치 구조를 판별하는 보조원입니다.
-아래는 한 구역의 승강기 칸 심볼 {n}개와 그 주변 골조(구조체 벽)선입니다. 좌표는 모두 이 구역을
-축에 맞게 돌려 놓은 로컬 좌표(mm)이고, 도면의 문자/주석은 주어지지 않습니다 — 기하만으로 판단하세요.
-
-승강기 칸 심볼(id: 중심, 심볼 윤곽 크기):
-{shaft_lines}
-
-수직 골조선 (x좌표 | y구간):
-{v_lines}
-
-수평 골조선 (y좌표 | x구간):
-{h_lines}
-
-과제: 이 {n}개 칸을 "승강로(골조로 둘러싸인 하나의 공간)" 단위(bay)로 묶으세요.
-- 칸이 자기만의 골조 사각형 안에 혼자 있으면 그 칸은 혼자 하나의 bay입니다(단독).
-- 칸막이 없이 여러 대가 하나의 골조 사각형 안에 나란히 들어 있거나, 칸 사이에 칸막이 골조가
-  있어 나란히 붙은 여러 대는 한 bay(병렬 코어, 대수 = 칸 수)로 묶습니다. 2대, 3대, ... N대 모두 가능합니다.
-- 로비/통로를 사이에 두고 서로 마주 보는 별개의 골조 공간이면 서로 다른 bay입니다.
-- 모든 칸은 정확히 하나의 bay에 속해야 합니다.
-
-반드시 JSON으로만 답하세요(설명 문장 금지):
-{{"bays": [{{"members": [1, 2]}}, {{"members": [3]}}]}}"""
-
-
-def _ai_classify_bays(segs, members, api_key, model, provider, max_lines=70):
-    """AI에게 병렬 후보 그룹의 구조(단독/병렬, 병렬이면 몇 대인지)를 판별시킨다.
-    반환: [bay_id per member] 또는 None(AI 실패/검증 실패 — 호출부가 규칙 기반으로 대체)."""
-    frame = _group_local_frame(segs, members)
-    if not frame or not api_key:
-        return None
-    n = len(members)
-
-    def _top(lines):
-        lines = sorted(lines, key=lambda l: -sum(b - a for a, b in l['spans']))[:max_lines]
-        return sorted(lines, key=lambda l: l['pos'])
-
-    def _fmt(lines, tag):
-        return '\n'.join(f"{tag}={ln['pos']:.0f} | " + ', '.join(f"[{a:.0f}~{b:.0f}]" for a, b in ln['spans'][:4])
-                         for ln in lines)
-
-    shaft_lines = '\n'.join(
-        f"- id {k}: 중심 ({c[0]:.0f}, {c[1]:.0f}), 심볼 약 {g[2] - g[0]:.0f}x{g[3] - g[1]:.0f}"
-        for k, (c, g) in enumerate(zip(frame['centers'], frame['guesses']), start=1))
-    prompt = BAY_AI_PROMPT.format(n=n, shaft_lines=shaft_lines,
-                                  v_lines=_fmt(_top(frame['verticals']), 'x'),
-                                  h_lines=_fmt(_top(frame['horizontals']), 'y'))
-    try:
-        raw = ai_client.generate_text(api_key, model, prompt, provider=provider,
-                                      response_format={'type': 'json_object'}, _context='ai_classify_bays')
-        data = _extract_json(raw)
-        bays = data.get('bays') if isinstance(data, dict) else None
-    except Exception:
-        traceback.print_exc()
-        return None
-    if not isinstance(bays, list):
-        return None
-    bay_of = {}
-    for bi, b in enumerate(bays):
-        try:
-            for mid in b['members']:
-                mid = int(mid)
-                if not (1 <= mid <= n) or mid in bay_of:
-                    return None
-                bay_of[mid] = bi
-        except Exception:
-            return None
-    if len(bay_of) != n:
-        return None
-    return [bay_of[k] for k in range(1, n + 1)]
-
-
 def _snap_parallel_bays(segs, members, bay_of=None, min_size_mm: float = 1200.0,
                          max_size_mm: float = 6500.0):
     """병렬 그룹(members: 클러스터 dict 리스트)의 칸별 승강로 사각형을 골조 벽선(segs)만으로
@@ -2308,24 +2083,6 @@ def write_shaft_layer_dxf(dxf_path: str, shapes, layer_name: str = '승강로 �
     except Exception:
         traceback.print_exc()
         return None
-
-
-def _extract_json(text: str) -> dict:
-    """AI 응답 문자열에서 JSON 객체를 최대한 관대하게 추출한다."""
-    if not text:
-        return {}
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?', '', text.strip())
-    text = re.sub(r'```$', '', text.strip())
-    start = text.find('{')
-    end = text.rfind('}')
-    if start == -1 or end == -1 or end <= start:
-        return {}
-    try:
-        return json.loads(text[start:end + 1])
-    except Exception:
-        return {}
-
 
 
 # ──────────────────────────────────────────────────────────────
@@ -2508,10 +2265,6 @@ class ElevatorShaftReviewModule:
         return [t.strip() for t in re.split(r'[,;\s]+', raw or '') if t.strip()]
 
     # ── 공통 API 키/모델 조회 ──────────────────────────────────
-    def _get_api(self):
-        sa = getattr(self.main_app, 'shared_api', None) or {}
-        return sa.get('api_key', ''), sa.get('model', ''), sa.get('provider', 'gemini')
-
     # ── 카드 헬퍼 (허브 스타일과 동일) ─────────────────────────
     def _make_card(self, parent, padx=24, pady=20, bg=SURFACE):
         outer = tk.Frame(parent, bg=BORDER_SOFT)
@@ -2658,7 +2411,7 @@ class ElevatorShaftReviewModule:
         self.lbl_progress_pct.pack(side='left', padx=(8, 0))
 
         # 상태 문구 라벨은 화면에 표시하지 않는다(내부 호출 호환용으로만 둔다)
-        self.lbl_ai_status = tk.Label(card, text='')
+        self.lbl_status = tk.Label(card, text='')
 
         parking_tree_frame = tk.Frame(card, bg=SURFACE)
         parking_tree_frame.pack(fill='x', pady=(12, 4))
@@ -2751,49 +2504,6 @@ class ElevatorShaftReviewModule:
     # ══════════════════════════════════════════════════════════
     #  지하주차장 전체평면도 승강로 탐지+스냅
     # ══════════════════════════════════════════════════════════
-    def _ai_identify_wall_layers(self, dxf_path, api_key, model, provider):
-        """이 도면에서 승강로를 둘러싼 "구조체 콘크리트 벽/기둥" 레이어가 어느
-        것인지 AI에게 물어 판별한다. 설계사마다 벽 레이어명이 제각각이라(골조/
-        G-WAL/A-Wall/CON/G-CON/WAL-H 등) 하드코딩된 키워드 하나로는 범용적으로
-        대응할 수 없다는 사용자 피드백에 따라 추가 — 레이어별 선분 통계를
-        계산해 보여주고, 레이어"명"의 의미를 읽을 수 있는 AI가 직접 고르게
-        한다. 같은 파일을 여러 번 분석해도 매번 다시 묻지 않도록 파일 경로
-        기준으로 캐시한다. 반환: 유력한 순서로 정렬된 레이어명 리스트(검증
-        실패/빈 결과면 빈 리스트 — 호출부가 폴백하게 한다)."""
-        cache = getattr(self, '_wall_layer_cache', None)
-        if cache is None:
-            cache = self._wall_layer_cache = {}
-        if dxf_path in cache:
-            return cache[dxf_path]
-
-        stats = _collect_layer_line_stats(dxf_path)
-        if not stats:
-            cache[dxf_path] = []
-            return []
-        valid_names = {s['layer'] for s in stats}
-        # 노이즈(아주 짧은 선 몇 개뿐인 레이어)는 제외하고, 프롬프트 길이를
-        # 위해 상위 60개로 제한한다 — 벽 레이어가 60위 밖일 정도로 짧게
-        # 그려진 경우는 현실적으로 거의 없다.
-        shown = [s for s in stats if s['count'] >= 5][:60]
-        layer_lines = '\n'.join(
-            f"- {s['layer']}  (선분 {s['count']}개, 총길이 {s['total_length_mm'] / 1000:.1f}m)"
-            for s in shown
-        )
-        prompt = WALL_LAYER_AI_PROMPT_TEMPLATE.format(layer_lines=layer_lines)
-        try:
-            raw = ai_client.generate_text(
-                api_key, model, prompt, provider=provider,
-                response_format={'type': 'json_object'}, _context='ai_identify_wall_layers')
-            data = _extract_json(raw)
-            candidates = data.get('wall_layers') if isinstance(data, dict) else None
-        except Exception:
-            traceback.print_exc()
-            candidates = None
-
-        result = [c for c in (candidates or []) if c in valid_names]
-        cache[dxf_path] = result
-        return result
-
     # ── ① 승강기 심볼 위치 탐지 (로컬 전용 — AI 호출 없음, 빠르고 정확) ──
     def _reset_parking_state(self):
         self.parking_clusters = []
@@ -2842,14 +2552,12 @@ class ElevatorShaftReviewModule:
         self._ukw_cache = self._user_layer_keywords()
         self._wkw_cache = self._user_layer_keywords(wall=True)
         self._save_elev_pref()
-        api = ('', '', '')     # 분석은 도면 기하만 사용한다(네트워크/API 불필요)
         self._reset_parking_state()
         for b in (self.btn_load_dxf, self.btn_analyze):
             b.config(state='disabled')
-        threading.Thread(target=self._parking_analyze_thread, args=(path, api), daemon=True).start()
+        threading.Thread(target=self._parking_analyze_thread, args=(path,), daemon=True).start()
 
-    def _parking_analyze_thread(self, path, api):
-        api_key, model, provider = api
+    def _parking_analyze_thread(self, path):
         clusters, wall_layers, results, failed = [], [], [], False
         try:
             self._set_pct(2)
@@ -2861,11 +2569,11 @@ class ElevatorShaftReviewModule:
                 clusters = _find_shaft_points_by_layer(path, layer_keywords=SHAFT_LAYER_KEYWORDS)
             self._set_pct(15)
             if clusters:
-                wall_layers, _summary, _info = self._analyze_walls(path, clusters, api_key, model, provider)
+                wall_layers, _summary, _info = self._analyze_walls(path, clusters)
                 self._set_pct(55)
                 results = self._snap_parking_clusters_to_walls(
                     path, clusters, wall_layers,
-                    progress_cb=lambda i, t: self._set_pct(55 + 45.0 * i / max(t, 1)), api=api)
+                    progress_cb=lambda i, t: self._set_pct(55 + 45.0 * i / max(t, 1)))
         except Exception:
             traceback.print_exc()
             failed = True
@@ -2910,26 +2618,19 @@ class ElevatorShaftReviewModule:
         msg += ('\n도면 표기본을 원본 옆에 저장했습니다.' if marked else '\n도면 표기본 저장에는 실패했습니다.')
         messagebox.showinfo('완료', msg)
 
-    def _analyze_walls(self, path, clusters, api_key, model, provider):
+    def _analyze_walls(self, path, clusters):
         wall_layers = []
-        info = {'ai_layers': [], 'scores': [], 'error': None}
+        info = {'scores': [], 'error': None}
         try:
-            # (a) AI가 레이어명+선 통계로 벽체 후보를 나열한다(키가 있을 때).
-            if api_key:
-                try:
-                    info['ai_layers'] = self._ai_identify_wall_layers(path, api_key, model, provider)
-                except Exception:
-                    traceback.print_exc()
             self._set_pct(25)
-            # (b) 이름에 벽/구조체 단서가 있는 레이어도 후보 풀에 넣고(AI가 G-CON을 빼먹는 경우 대비),
-            #     (c) 승강로 심볼을 실제로 둘러싸는 정도(기하 점수)로 최종 순위를 정한다 — AI 나열 순서나
-            #     이름이 아니라 도면 기하가 구조체 레이어를 고른다. 점수 높은 상위 레이어들은 하나의
+            # 이름에 벽/구조체 단서가 있는 레이어도 후보 풀에 넣고,
+            # 승강로 심볼을 실제로 둘러싸는 정도(기하 점수)로 최종 순위를 정한다 — 이름이 아니라 도면 기하가 구조체 레이어를 고른다. 점수 높은 상위 레이어들은 하나의
             #     벽선 집합으로 합쳐 '가장 가까운 선'을 쓴다(구조체 면이 기준선보다 승강로에 가깝다).
             import ezdxf
             msp = ezdxf.readfile(path).modelspace()
             stats = _collect_layer_line_stats(path)
             self._set_pct(32)
-            name_cands = list(dict.fromkeys(list(info['ai_layers']) + _structural_layer_names(stats)))
+            name_cands = list(dict.fromkeys(_structural_layer_names(stats)))
             # 이름에 단서가 없는 벽 레이어('w', 'c' 같은 짧은 이름 — 실측)도 놓치지 않도록, 선이 충분히 있는
             # 모든 레이어를 후보 풀에 넣어 기하 점수로만 가린다(중심선/치수/승강기 자체 레이어는 이름으로 제외).
             # (XREF 접두 '지하1층주차장$0$'에도 '주차'가 들어 있으므로 이름 검사는 마지막 부분만 한다)
@@ -2980,23 +2681,19 @@ class ElevatorShaftReviewModule:
                         extra.sort(key=lambda t: (_layer_priority(t[0]), -t[1]))
                         wall_layers += [l for l, _sc in extra]
                 info['covered'] = len(set().union(*[cv for _l, _sc, cv in ranked if _l in wall_layers])) if wall_layers else 0
-            else:
-                wall_layers = list(info['ai_layers'])
         except Exception as e:
             traceback.print_exc()
             info['error'] = f'벽 레이어 순위 산정 실패: {e}'
-            wall_layers = list(info['ai_layers'])
         summary = None
         if wall_layers and clusters:
             try:
-                summary = self._classify_parking_layouts(path, clusters, wall_layers,
-                                                         (api_key, model, provider))
+                summary = self._classify_parking_layouts(path, clusters, wall_layers)
             except Exception as e:
                 traceback.print_exc()
                 info['error'] = f"승강로 구성(단독/병렬) 판별 실패: {e}"
         return wall_layers, summary, info
 
-    def _classify_parking_layouts(self, dxf_path, clusters, wall_layers, api):
+    def _classify_parking_layouts(self, dxf_path, clusters, wall_layers):
         """②의 두 번째 일: ①이 거리 규칙으로 묶어둔 후보 그룹마다 "단독인지, 병렬이면 몇 대인지"
         (= 골조로 둘러싸인 승강로 bay 구성)를 AI가 기하(심볼 윤곽+골조선, 도면 문자 미사용)만 보고
         판별한다. AI 결과가 없거나 도면 기하와 안 맞으면 골조 포함관계 규칙으로 대체한다.
@@ -3026,10 +2723,8 @@ class ElevatorShaftReviewModule:
                     frame = _group_local_frame(segs, members)
                     if not frame:
                         continue
-                    cand = _ai_classify_bays(segs, members, *api) if api and api[0] else None
-                    used_ai = cand is not None and _bays_plausible(frame, cand)
-                    if not used_ai:
-                        cand = _bays_by_containment(frame)
+                    cand = _bays_by_containment(frame)
+                    used_ai = False
                     ok = len(_snap_parallel_bays(segs, members, bay_of=cand)) == len(members)
                     if first is None:
                         first = (cand, used_ai)
@@ -3061,7 +2756,7 @@ class ElevatorShaftReviewModule:
         return {'layout_sizes': dict(layout_sizes), 'bay_sizes': dict(bay_sizes),
                 'n_ai': n_ai, 'n_rule': n_rule}
 
-    def _snap_parking_clusters_to_walls(self, dxf_path, clusters, wall_layers, progress_cb=None, api=None,
+    def _snap_parking_clusters_to_walls(self, dxf_path, clusters, wall_layers, progress_cb=None,
                                          status_cb=None):
         """①에서 찾은 심볼 위치(clusters)마다, ②에서 판별한 벽체 레이어(wall_layers)의
         벽선에 스냅을 시도한다. 벽 스냅이 실패하면(벽 레이어를 못 찾았거나 주변에
@@ -3264,10 +2959,10 @@ class ElevatorShaftReviewModule:
             return bool(out_path)
         if out_path:
             msg = f'✅ "승강로 사이즈" 레이어로 표시한 사본을 원본 옆에 저장했습니다: {os.path.basename(out_path)}'
-            self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS)
+            self.lbl_status.config(text=msg, fg=ACCENT_SUCCESS)
         else:
             msg = '❌ 주황 폴리선 사본 저장에 실패했습니다.'
-            self.lbl_ai_status.config(text=msg, fg=ACCENT_DANGER)
+            self.lbl_status.config(text=msg, fg=ACCENT_DANGER)
         messagebox.showinfo('완료' if out_path else '오류', msg)
 
     # ── ⑤ 확정 승강로 전체 검토표에 일괄 반영 ──
@@ -3309,7 +3004,7 @@ class ElevatorShaftReviewModule:
         msg = f'✅ 확정 승강로 전체 검토표를 현재 도면 결과 {n_added}건으로 교체했습니다(동 구분은 직접 입력하세요).'
         if n_low_conf:
             msg += f' ⚠ {n_low_conf}건은 벽체 미검출(심볼 윤곽 크기)로 표시됨 — 도면에서 직접 확인 필요.'
-        self.lbl_ai_status.config(text=msg, fg=ACCENT_SUCCESS if not n_low_conf else ACCENT_WARNING)
+        self.lbl_status.config(text=msg, fg=ACCENT_SUCCESS if not n_low_conf else ACCENT_WARNING)
         if quiet:
             return n_added, n_low_conf
         messagebox.showinfo('완료', msg)
@@ -3631,7 +3326,7 @@ class ElevatorShaftReviewModule:
         msgs = [source_label, f'검토 행 {len(self.rows)}건을 불러왔습니다.']
         if n_row_fail:
             msgs.append(f'⚠ 검토 행 {n_row_fail}건은 복원하지 못했습니다(값이 손상됐을 수 있습니다).')
-        self.lbl_ai_status.config(text='\n'.join(msgs), fg=ACCENT_DANGER if n_row_fail else ACCENT_SUCCESS)
+        self.lbl_status.config(text='\n'.join(msgs), fg=ACCENT_DANGER if n_row_fail else ACCENT_SUCCESS)
         self._refresh_project_label()
 
     def _add_row_from_dict(self, d):
@@ -3932,8 +3627,7 @@ class _ProjectManagerDialog(tk.Toplevel):
 # ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     class _FakeMainApp:
-        def __init__(self):
-            self.shared_api = {'api_key': '', 'model': '', 'provider': 'gemini'}
+        pass
 
     root = tk.Tk()
     root.title('승강로 CAD 도면 분석 (단독 실행)')
