@@ -2361,8 +2361,6 @@ class ElevatorShaftReviewModule:
         session_btn_row = tk.Frame(session_row, bg=CANVAS_BG)
         session_btn_row.pack(side='top')
         self._metal_btn(session_btn_row, '🗂 프로젝트 관리', self._open_project_manager,
-                         text_color=BTN_METAL_TEXT_PRIMARY, bold=True).pack(side='left', padx=(0, 8))
-        self._metal_btn(session_btn_row, '📂 이어하기', self._resume_session,
                          text_color=BTN_METAL_TEXT_PRIMARY, bold=True).pack(side='left')
         self._refresh_project_label()
 
@@ -3252,7 +3250,7 @@ class ElevatorShaftReviewModule:
             messagebox.showerror('저장 실패', f'{e}')
 
     # ══════════════════════════════════════════════════════════
-    #  진행상태 저장 / 이어하기(JSON) — 검토표(self.rows)를 다시 입력하지 않고,
+    #  프로젝트 상태 직렬화 — 검토표(self.rows)를 다시 입력하지 않고,
     #  저장된 시점의 상태를 그대로 불러와 이어서 작업할 수 있게 한다.
     # ══════════════════════════════════════════════════════════
     SESSION_VERSION = 2
@@ -3261,8 +3259,7 @@ class ElevatorShaftReviewModule:
         return {k: r.get(k) for k in ('dong', 'core', 'cap', 'layout', 'actual')}
 
     def _build_session_dict(self):
-        """현재 진행 상태(검토 행 전체)를 JSON 저장용 dict로 만든다. "이어하기"가
-        이 파일을 열면 검토표가 그대로 복원된다(탐지 자체를 다시 돌릴 필요 없음)."""
+        """현재 진행 상태(검토 행 전체)를 JSON 저장용 dict로 만든다. 저장된 프로젝트를 열면 검토표가 그대로 복원된다."""
         return {
             'version': self.SESSION_VERSION,
             'saved_at': datetime.now().isoformat(timespec='seconds'),
@@ -3270,47 +3267,9 @@ class ElevatorShaftReviewModule:
             'rows': [self._serialize_row(r) for r in self.rows],
         }
 
-    def _save_session(self):
-        """현재 "확정 승강로 전체 검토표"를 JSON으로 저장한다 — "📂 이어하기"로
-        다시 열면 검토표가 그대로 복원된다."""
-        if not self.rows:
-            messagebox.showwarning('경고', '저장할 검토 행이 없습니다. 먼저 승강로를 탐지하세요.')
-            return
-        path = filedialog.asksaveasfilename(
-            title='진행상태 저장', defaultextension='.json', initialfile='승강로검토_진행상태.json',
-            filetypes=[('JSON Files', '*.json'), ('All Files', '*.*')])
-        if not path:
-            return
-        session = self._build_session_dict()
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(session, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            traceback.print_exc()
-            messagebox.showerror('저장 실패', f'{e}')
-            return
-        messagebox.showinfo('저장 완료', f'검토 행 {len(self.rows)}건을 저장했습니다.\n{path}')
-
-    def _resume_session(self):
-        path = filedialog.askopenfilename(
-            title='이어하기 — 저장된 진행 상태 불러오기', filetypes=[('JSON Files', '*.json'), ('All Files', '*.*')])
-        if not path:
-            return
-        if self.rows and not messagebox.askyesno(
-                '확인', '현재 화면의 내용을 지우고 저장된 진행 상태를 불러오시겠습니까?'):
-            return
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                session = json.load(f)
-        except Exception as e:
-            traceback.print_exc()
-            messagebox.showerror('불러오기 실패', f'{e}')
-            return
-        self._apply_session_dict(session, f'📂 이어하기: {os.path.basename(path)}')
-
     def _apply_session_dict(self, session, source_label):
         """세션 dict(파일로 연 것이든, 🗂 프로젝트 관리에서 불러온 것이든)를 화면에
-        복원한다. _resume_session과 프로젝트 관리 "불러오기"가 공유하는 실제 복원
+        복원한다. 프로젝트 관리 "불러오기"가 쓰는 실제 복원
         로직 — source_label만 다르고(어디서 불러왔는지 안내문 첫 줄에 표시) 나머지는
         완전히 동일하다."""
         self.current_project_name = session.get('project_name')
