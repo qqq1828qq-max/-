@@ -2043,7 +2043,8 @@ def _assign_core_labels(results):
     return labels
 
 
-def write_shaft_layer_dxf(dxf_path: str, shapes, layer_name: str = '승강로 사이즈', suffix: str = '_검토'):
+def write_shaft_layer_dxf(dxf_path: str, shapes, layer_name: str = '승강로 사이즈', suffix: str = '_검토',
+                          out_path=None):
     """원본 DXF는 건드리지 않고 '<원본이름>_검토.dxf' 사본을 만들어, shapes(각 항목
     {'points': [(x,y),...], 'label': str, 'layer': str(선택)}) 를 지정한 레이어에
     "새로" 닫힌 폴리선(+라벨 텍스트)으로 추가한다. 성공 시 사본 경로, 실패 시 None.
@@ -2094,8 +2095,9 @@ def write_shaft_layer_dxf(dxf_path: str, shapes, layer_name: str = '승강로 �
                                  ).set_placement((cx, cy))
                 except Exception:
                     pass  # 라벨은 부가 정보이므로 실패해도 폴리선 추가 자체는 유지
-        base, ext = os.path.splitext(dxf_path)
-        out_path = f'{base}{suffix}{ext or ".dxf"}'
+        if not out_path:
+            base, ext = os.path.splitext(dxf_path)
+            out_path = f'{base}{suffix}{ext or ".dxf"}'
         doc.saveas(out_path)
         return out_path
     except Exception:
@@ -2117,6 +2119,39 @@ def _user_data_dir():
         return __compiled__.containing_dir
     except NameError:
         return os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_oda_converter(saved=''):
+    """ODA File Converter 실행 파일을 찾는다: 저장된 경로 → 프로그램 옆 → 설치 기본 위치."""
+    import glob
+    cands = [saved] if saved else []
+    here = _user_data_dir()
+    cands += [os.path.join(here, 'ODAFileConverter.exe'),
+              os.path.join(here, 'ODAFileConverter', 'ODAFileConverter.exe')]
+    for base in (os.environ.get('ProgramFiles', r'C:\Program Files'), os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')):
+        cands += sorted(glob.glob(os.path.join(base, 'ODA', 'ODAFileConverter*', 'ODAFileConverter.exe')), reverse=True)
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return ''
+
+
+def convert_dwg_to_dxf(exe, dwg_path, out_dir, timeout=900):
+    """ODA File Converter(명령줄)로 DWG를 DXF(ACAD2018)로 변환한다. 성공 시 DXF 경로, 실패 시 None."""
+    import subprocess
+    in_dir = os.path.dirname(os.path.abspath(dwg_path))
+    name = os.path.basename(dwg_path)
+    kw = {}
+    if os.name == 'nt':
+        kw['creationflags'] = 0x08000000   # CREATE_NO_WINDOW
+    try:
+        subprocess.run([exe, in_dir, out_dir, 'ACAD2018', 'DXF', '0', '1', name],
+                       check=False, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except Exception:
+        traceback.print_exc()
+        return None
+    out = os.path.join(out_dir, os.path.splitext(name)[0] + '.dxf')
+    return out if os.path.isfile(out) and os.path.getsize(out) > 0 else None
 
 
 PROJECTS_DIR = os.path.join(_user_data_dir(), '.elevator_projects')
@@ -2210,6 +2245,7 @@ class ElevatorShaftReviewModule:
         self._wkw_cache = []
         self._wall_prompted = False
         self.parking_source_path = None
+        self.parking_origin_path = None
         self.parking_clusters = []       # ① 심볼 위치 탐지 결과(벽 스냅 전, bbox만)
         self.parking_wall_layers = []    # ② AI가 판별한 벽체 레이어명 목록
         self.parking_shaft_results = []  # ③ 벽체 스냅까지 끝난 최종 결과
@@ -2236,10 +2272,19 @@ class ElevatorShaftReviewModule:
             return ''
 
     def _save_elev_pref(self):
+        self._pref_set(elev_layer=self.var_elev_kw.get().strip(), wall_layer=self.var_wall_kw.get().strip())
+
+    def _pref_set(self, **kv):
         try:
+            data = {}
+            try:
+                with open(self._elev_pref_path(), 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            data.update(kv)
             with open(self._elev_pref_path(), 'w', encoding='utf-8') as f:
-                json.dump({'elev_layer': self.var_elev_kw.get().strip(), 'wall_layer': self.var_wall_kw.get().strip()},
-                          f, ensure_ascii=False)
+                json.dump(data, f, ensure_ascii=False)
         except Exception:
             pass
 
@@ -2534,19 +2579,51 @@ class ElevatorShaftReviewModule:
         """도면(DXF)을 불러온다."""
         path = filedialog.askopenfilename(
             title="도면 선택",
-            filetypes=[('DXF Files', '*.dxf'), ('All Files', '*.*')]
+            filetypes=[('CAD 도면', '*.dxf *.dwg'), ('DXF Files', '*.dxf'), ('DWG Files', '*.dwg'), ('All Files', '*.*')]
         )
         if not path:
             return False
+        self.parking_origin_path = path
+        if path.lower().endswith('.dwg'):
+            path = self._convert_dwg(path)
+            if not path:
+                return False
         self.parking_source_path = path
         self._reset_parking_state()
         try:
             size_txt = f' ({os.path.getsize(path) / (1024 * 1024):.1f}MB)'
         except Exception:
             size_txt = ''
-        self.lbl_dxf_file.config(text=f'불러온 도면: {os.path.basename(path)}{size_txt}', fg=TEXT_PRIMARY)
+        self.lbl_dxf_file.config(text=f'불러온 도면: {os.path.basename(self.parking_origin_path)}{size_txt}', fg=TEXT_PRIMARY)
         self.btn_analyze.config(state='normal')
         return True
+
+    def _convert_dwg(self, dwg_path):
+        """DWG를 ODA File Converter로 임시 DXF로 변환한다. 실패하면 None."""
+        import tempfile, atexit, shutil
+        exe = _find_oda_converter(self._pref_get('oda_path'))
+        if not exe:
+            messagebox.showinfo('안내', 'DWG 변환 프로그램(ODA File Converter)을 찾지 못했습니다.\n'
+                                        '설치 후 실행 파일(ODAFileConverter.exe) 위치를 지정해 주세요.')
+            exe = filedialog.askopenfilename(title='ODAFileConverter.exe 선택',
+                                             filetypes=[('실행 파일', '*.exe'), ('All Files', '*.*')])
+            if not exe:
+                return None
+            self._pref_set(oda_path=exe)
+        self.lbl_dxf_file.config(text='DWG 변환 중...', fg=TEXT_MUTED)
+        self.parent.update_idletasks()
+        tmp = tempfile.mkdtemp(prefix='shaft_')
+        atexit.register(shutil.rmtree, tmp, True)
+        out = convert_dwg_to_dxf(exe, dwg_path, tmp)
+        if not out:
+            self.lbl_dxf_file.config(text='불러온 도면: 없음', fg=TEXT_MUTED)
+            messagebox.showerror('변환 실패', 'DWG를 DXF로 변환하지 못했습니다.\n'
+                                              'ODA File Converter 경로와 도면 파일을 확인해 주세요.')
+            return None
+        return out
+
+    def _pref_get(self, key):
+        return self._load_elev_pref(key)
 
     def _set_pct(self, pct):
         """진행률(%)만 표시한다. 어느 스레드에서 불러도 안전하다."""
@@ -2970,8 +3047,10 @@ class ElevatorShaftReviewModule:
             if key is not None:
                 merged[key] = item
         try:
-            out_path = write_shaft_layer_dxf(self.parking_source_path, shapes,
-                                              layer_name='승강로 사이즈', suffix='_승강로검토')
+            origin = self.parking_origin_path or self.parking_source_path
+            out_path = write_shaft_layer_dxf(
+                self.parking_source_path, shapes, layer_name='승강로 사이즈', suffix='_승강로검토',
+                out_path=os.path.splitext(origin)[0] + '_승강로검토.dxf')
         except Exception:
             traceback.print_exc()
             out_path = None
