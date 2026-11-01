@@ -32,11 +32,8 @@ class ElevatorReviewApp(tk.Tk):
             self.destroy()
             return
         _sec.bind_admin_hotkey(self)
-        _exp, _left = _sec.expiry_status()
-        if _exp:
-            self.title("승강기 검토 - 승강로")
-            self.geometry("420x120")
-            tk.Label(self, text="사용 기간이 만료되었습니다.\n관리자에게 문의하세요.", pady=30).pack()
+        if _sec.expiry_status()[0]:
+            self._fatal_exit()
             return
 
         # 윈도우 설정
@@ -50,6 +47,31 @@ class ElevatorReviewApp(tk.Tk):
             pass
 
         self._build_ui()
+        self.after(600000, self._periodic_expiry_check)
+
+    def _periodic_expiry_check(self):
+        if _sec.expiry_status()[0]:
+            self._fatal_exit()
+            return
+        self.after(600000, self._periodic_expiry_check)
+
+    def _fatal_exit(self):
+        """사용 기간 종료: 영어 심각 오류 창을 띄우고 강제 종료한다."""
+        for w in self.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self.title("Error")
+        self.geometry("460x170")
+        self.resizable(False, False)
+        self.deiconify()
+        self.protocol("WM_DELETE_WINDOW", lambda: os._exit(1))
+        tk.Label(self, text="A critical error has occurred.\nThe application cannot continue and will be terminated.\n(Error code: 0xC0000409)",
+                 justify="left", padx=20, pady=24).pack(anchor="w")
+        tk.Button(self, text="OK", width=10, command=lambda: os._exit(1)).pack()
+        self.lift()
+        self.attributes("-topmost", True)
 
     # ──────────────────────────────────────────────────────────
     #  UI 헬퍼 (Design Hub와 동일한 스타일 유지)

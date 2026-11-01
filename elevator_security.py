@@ -7,6 +7,9 @@ _DEFAULT_USERS = ["161808", "162872", "149710", "152356", "162858",
                   "157901", "162846", "162264", "162646"]
 _KEY = b"\x5a\xc3\x11\x9e\x70\x2d\xb4\x68\xf1\x07\xa9\x3c\xd2\x84\x4e\x95"
 _FILE = ".admin_settings.json"
+# 설정 파일이 없거나 변조됐을 때 쓰는 내장 기간(빌드 전에 지정: 예 "2026-11-01", 90). 비워두면 무제한.
+_DEFAULT_START = ""
+_DEFAULT_DAYS = 0
 
 
 def _app_dir():
@@ -44,12 +47,12 @@ def _load():
             d = json.load(f)
         users = [str(u).strip() for u in d.get("users", []) if str(u).strip()]
         pw = d.get("pw") or None
-        ex = d.get("ex") or {"days": 0, "start": "", "last": ""}
+        ex = d.get("ex") or {"days": _DEFAULT_DAYS, "start": _DEFAULT_START, "last": ""}
         if users and hmac.compare_digest(str(d.get("sig", "")), _sign(users, pw, ex)):
             return users, pw, ex
     except Exception:
         pass
-    return list(_DEFAULT_USERS), None, {"days": 0, "start": "", "last": ""}
+    return list(_DEFAULT_USERS), None, {"days": _DEFAULT_DAYS, "start": _DEFAULT_START, "last": ""}
 
 
 def _save(users, pw, ex):
@@ -66,30 +69,33 @@ def _d(s):
 
 
 def expiry_status():
-    """(만료 여부, 남은 일수 또는 None=무제한). 시계를 되돌려도 마지막 확인일 이전으로는 못 간다."""
+    """(만료 여부, 남은 일수 또는 None=무제한). 시작일은 관리자가 입력한 날짜 고정이며,
+    PC 시계를 되돌려도 마지막으로 확인된 날짜 이전으로는 못 간다."""
     users, pw, ex = _load()
     days = int(ex.get("days") or 0)
     if days <= 0:
         return False, None
+    start = _d(ex.get("start", ""))
+    if start is None:
+        return True, 0          # 기간만 있고 시작일이 없으면 잠금
     now = _today()
     last = _d(ex.get("last", ""))
     if last and now < last:
         now = last
-    start = _d(ex.get("start", ""))
-    changed = False
-    if start is None:
-        start, changed = now, True
-        ex["start"] = start.isoformat()
     if last is None or now > last:
         ex["last"] = now.isoformat()
-        changed = True
-    if changed:
         try:
             _save(users, pw, ex)
         except Exception:
             pass
-    left = days - (now - start).days
+    left = days - max(0, (now - start).days)
     return left <= 0, max(left, 0)
+
+
+def end_date_text(ex):
+    st = _d(ex.get("start", ""))
+    days = int(ex.get("days") or 0)
+    return (st + datetime.timedelta(days=days)).isoformat() if st and days > 0 else ""
 
 
 def _allowed(users):
@@ -135,7 +141,7 @@ def open_user_manager(parent):
     users, pw, ex = _load()
     dlg = tk.Toplevel(parent)
     dlg.title("사용자 관리")
-    dlg.geometry("340x480")
+    dlg.geometry("360x540")
     dlg.transient(parent)
     dlg.grab_set()
     tk.Label(dlg, text=f"현재 PC: {platform.node().upper()}").pack(pady=(10, 2))
@@ -169,9 +175,13 @@ def open_user_manager(parent):
         except ValueError:
             messagebox.showwarning("사용자 관리", "기간은 숫자로 입력하세요.", parent=dlg)
             return
-        nex = dict(ex)
-        if nd != int(ex.get("days") or 0):
-            nex = {"days": nd, "start": _today().isoformat() if nd else "", "last": _today().isoformat() if nd else ""}
+        sd = sent.get().strip()
+        if nd > 0 and _d(sd) is None:
+            messagebox.showwarning("사용자 관리", "시작 날짜를 YYYY-MM-DD 형식으로 입력하세요.", parent=dlg)
+            return
+        nex = {"days": nd, "start": sd if nd else "", "last": ""}
+        if nd and nex["start"] == ex.get("start") and nd == int(ex.get("days") or 0):
+            nex["last"] = ex.get("last", "")
         _save(items, pw, nex)
         messagebox.showinfo("사용자 관리", "저장했습니다.", parent=dlg)
         dlg.destroy()
@@ -185,14 +195,20 @@ def open_user_manager(parent):
 
     tk.Button(row, text="추가", command=add).pack(side="left")
     tk.Button(row, text="삭제", command=rem).pack(side="left", padx=4)
+    srow = tk.Frame(dlg)
+    srow.pack(pady=2)
+    tk.Label(srow, text="시작 날짜(YYYY-MM-DD)").pack(side="left")
+    sent = tk.Entry(srow, width=12)
+    sent.pack(side="left", padx=4)
+    sent.insert(0, ex.get("start") or _today().isoformat())
     drow = tk.Frame(dlg)
-    drow.pack(pady=4)
+    drow.pack(pady=2)
     tk.Label(drow, text="사용 기간(일, 0=무제한)").pack(side="left")
     dent = tk.Entry(drow, width=6)
     dent.pack(side="left", padx=4)
     dent.insert(0, str(int(ex.get("days") or 0)))
     _exp, _left = expiry_status()
-    tk.Label(dlg, text=("무제한" if _left is None else f"남은 기간: {_left}일 (시작 {ex.get('start') or _today()})")).pack()
+    tk.Label(dlg, text=("무제한" if _left is None else f"종료일 {end_date_text(ex)} · 남은 기간 {_left}일")).pack()
     bot = tk.Frame(dlg)
     bot.pack(pady=8)
     tk.Button(bot, text="저장", width=8, command=save).pack(side="left", padx=4)
