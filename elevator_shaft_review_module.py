@@ -1620,7 +1620,7 @@ PARALLEL_FIX_PROMPT = """당신은 건축 평면도에서 승강로(엘리베이
 
 
 def _local_wall_lines(segs, origin, angle_deg, window, min_len=300.0, max_len=12000.0,
-                       axis_tol_deg=5.0, cluster_tol=40.0, join_gap=150.0, min_merged=400.0):
+                       axis_tol_deg=5.0, cluster_tol=10.0, join_gap=150.0, min_merged=400.0):
     """segs(월드 좌표 선분)를 origin 기준으로 -angle_deg 회전한 로컬 좌표로 바꾸고,
     window(x0,y0,x1,y1 — 로컬) 안의 수직/수평 벽선을 같은 좌표끼리 묶어 겹치지 않는
     구간 목록으로 돌려준다. 반환: (verticals, horizontals) —
@@ -1640,20 +1640,20 @@ def _local_wall_lines(segs, origin, angle_deg, window, min_len=300.0, max_len=12
             continue
         ang = math.degrees(math.atan2(abs(ly1 - ly0), abs(lx1 - lx0)))
         if ang >= 90 - axis_tol_deg:
-            vs.append((mx, min(ly0, ly1), max(ly0, ly1)))
+            vs.append((mx, min(ly0, ly1), max(ly0, ly1), length))
         elif ang <= axis_tol_deg:
-            hs.append((my, min(lx0, lx1), max(lx0, lx1)))
+            hs.append((my, min(lx0, lx1), max(lx0, lx1), length))
 
     def _group(items):
         items.sort(key=lambda t: t[0])
         groups = []
-        for pos, lo, hi in items:
+        for pos, lo, hi, ln in items:
             if groups and abs(pos - groups[-1]['pos_ref']) <= cluster_tol:
                 groups[-1]['ivs'].append((lo, hi))
-                groups[-1]['pos_sum'] += pos
-                groups[-1]['n'] += 1
+                if ln > groups[-1]['best'][0]:
+                    groups[-1]['best'] = (ln, pos)
             else:
-                groups.append({'pos_ref': pos, 'pos_sum': pos, 'n': 1, 'ivs': [(lo, hi)]})
+                groups.append({'pos_ref': pos, 'best': (ln, pos), 'ivs': [(lo, hi)]})
         out = []
         for g in groups:
             ivs = sorted(g['ivs'])
@@ -1665,7 +1665,8 @@ def _local_wall_lines(segs, origin, angle_deg, window, min_len=300.0, max_len=12
                     merged.append((lo, hi))
             merged = [(lo, hi) for lo, hi in merged if hi - lo >= min_merged]
             if merged:
-                out.append({'pos': g['pos_sum'] / g['n'], 'spans': merged})
+                # 평균 대신 가장 긴 선의 좌표를 쓴다 — 40mm 안의 다른 벽 조각이 섞여 평균이 어긋나는 것을 막는다.
+                out.append({'pos': g['best'][1], 'spans': merged})
         return out
 
     return _group(vs), _group(hs)
