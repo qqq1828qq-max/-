@@ -3021,16 +3021,33 @@ class ElevatorShaftReviewModule:
         except Exception:
             traceback.print_exc()
 
-        # 출력 기준: W/D를 도면 가로·세로 측정값과 반대로 내보낸다(사용 부서 요청). 모든 출력(미리보기·도면 라벨·검토표·엑셀)이
-        # 이 결과를 그대로 쓰므로 여기서 한 번만 바꾼다.
+        # 출력 기준: 승강기 문을 바라보고, 문이 포함된 벽(문 벽)의 길이가 W(Wide), 나머지(문에서 안쪽으로)가 D(Depth).
+        # 모든 출력(미리보기·도면 라벨·검토표·엑셀)이 이 결과를 그대로 쓰므로 여기서 한 번만 정한다.
+        # 폴리선은 첫 변이 W가 되도록 꼭짓점 순서를 맞춘다(sn.lsp는 첫 변을 W, 둘째 변을 D로 읽는다).
         for r in results:
-            r['width_mm'], r['depth_mm'] = r['depth_mm'], r['width_mm']
             pts_ = r.get('points')
-            if pts_ and len(pts_) == 4:
-                r['points'] = list(pts_[1:]) + [pts_[0]]     # sn.lsp는 폴리선 첫 변을 W, 둘째 변을 D로 읽는다
+            if not pts_ or len(pts_) != 4:
+                r['width_mm'], r['depth_mm'] = r['depth_mm'], r['width_mm']
+                continue
+            e1 = (pts_[1][0] - pts_[0][0], pts_[1][1] - pts_[0][1])
+            e2 = (pts_[2][0] - pts_[1][0], pts_[2][1] - pts_[1][1])
+            l1, l2 = math.hypot(*e1), math.hypot(*e2)
+            door = clusters[r['index'] - 1].get('door') if 0 < r['index'] <= len(clusters) else None
+            if door and l1 > 0 and l2 > 0:
+                # 문 방향과 수직인 변이 문 벽이다
+                d1 = abs(e1[0] * door[0] + e1[1] * door[1]) / l1
+                d2 = abs(e2[0] * door[0] + e2[1] * door[1]) / l2
+                first_is_w = d1 <= d2
+            else:
+                first_is_w = False          # 문 방향을 못 읽으면 둘째 변을 W로 둔다(이전 출력 기준)
+            if first_is_w:
+                w_, d_ = l1, l2
+            else:
+                w_, d_ = l2, l1
+                r['points'] = list(pts_[1:]) + [pts_[0]]
+            r['width_mm'], r['depth_mm'] = round(w_, 1), round(d_, 1)
             if r.get('bay_info'):
-                n_, bw_, bd_ = r['bay_info']
-                r['bay_info'] = (n_, bd_, bw_)
+                r['bay_info'] = (r['bay_info'][0], r['width_mm'], r['depth_mm'])
 
         # 미리보기·④·⑤가 같은 코어 번호를 쓰도록 라벨을 한 번에 부여한다.
         for idx, (label, parallel) in _assign_core_labels(results).items():
