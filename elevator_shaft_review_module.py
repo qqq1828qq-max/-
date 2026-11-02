@@ -545,9 +545,22 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
         passing = [c['key'] for c in coverage_list if c['ratio'] >= min_ratio]
         if side == 'low':
             cands = [k for k in passing if k <= center]
-            return max(cands) if cands else None
-        cands = [k for k in passing if k >= center]
-        return min(cands) if cands else None
+            k = max(cands) if cands else None
+        else:
+            cands = [k for k in passing if k >= center]
+            k = min(cands) if cands else None
+        if k is None:
+            return None
+        # 벽이 두 줄(두께 120~320mm 간격)로 그려져 있고 안쪽 줄이 문 개구부 등으로 더 많이 끊겨 기준 비율에
+        # 못 미치면 바깥 줄이 뽑혀 치수가 벽 두께만큼 커진다 — 안쪽 줄도 최소한의 커버(35%)가 있으면 안쪽을 쓴다.
+        inner_min = min(0.35, min_ratio)
+        inner = [c['key'] for c in coverage_list
+                 if c['ratio'] >= inner_min
+                 and ((side == 'low' and k + 120.0 <= c['key'] <= k + 320.0 and c['key'] <= center)
+                      or (side == 'high' and k - 320.0 <= c['key'] <= k - 120.0 and c['key'] >= center))]
+        if inner:
+            k = min(inner, key=lambda v: abs(v - k))
+        return k
 
     def _pick_strict():
         """strict_overlap_ratio 모드 전용: 2단계(상호 보정) 커버리지 판정.
