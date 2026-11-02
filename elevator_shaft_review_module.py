@@ -2597,7 +2597,7 @@ class ElevatorShaftReviewModule:
             size_txt = f' ({os.path.getsize(path) / (1024 * 1024):.1f}MB)'
         except Exception:
             size_txt = ''
-        self.lbl_dxf_file.config(text=f'불러온 도면: {os.path.basename(self.parking_origin_path)}{size_txt}', fg=TEXT_PRIMARY)
+        self.lbl_dxf_file.config(text=f'도면 로드 완료: {os.path.basename(self.parking_origin_path)}{size_txt}', fg=TEXT_PRIMARY)
         self.btn_analyze.config(state='normal')
         return True
 
@@ -2613,13 +2613,10 @@ class ElevatorShaftReviewModule:
             if not exe:
                 return None
             self._pref_set(oda_path=exe)
-        self.lbl_dxf_file.config(text='DWG 변환 중...', fg=TEXT_MUTED)
-        self.parent.update_idletasks()
         tmp = tempfile.mkdtemp(prefix='shaft_')
         atexit.register(shutil.rmtree, tmp, True)
         out = convert_dwg_to_dxf(exe, dwg_path, tmp)
         if not out:
-            self.lbl_dxf_file.config(text='불러온 도면: 없음', fg=TEXT_MUTED)
             messagebox.showerror('변환 실패', 'DWG를 DXF로 변환하지 못했습니다.\n'
                                               'ODA File Converter 경로와 도면 파일을 확인해 주세요.')
             return None
