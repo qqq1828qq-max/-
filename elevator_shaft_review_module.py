@@ -272,6 +272,12 @@ def _layer_priority(name):
     return 2
 
 
+def _is_def_layer(name):
+    """'Def_1', 'DOOR_DEF', 'Defpoints'처럼 이름에 DEF(정의/기준용) 토큰이 있는 레이어 — 골조 벽이 아니므로 자동 벽 후보에서 뺀다."""
+    last = (name or '').split('$')[-1].upper()
+    return any(t == 'DEF' or t.startswith('DEFPOINT') for t in re.split(r'[^A-Z0-9가-힣]+', last) if t)
+
+
 def _structural_layer_names(stats):
     """레이어명에 벽/구조체 단서가 있는 후보(AI가 놓쳤을 수 있는 G-CON 같은 이름까지 후보 풀에 넣는다).
     최종 선택은 이름이 아니라 아래 기하 점수(_rank_wall_layers)가 한다."""
@@ -487,7 +493,7 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
         span = min(a1 - a0, b1 - b0)
         return span > 0 and ov / span >= min_ratio
 
-    def _cluster_coverage(items, key, r0, r1, t0, t1, cluster_tol=25.0):
+    def _cluster_coverage(items, key, r0, r1, t0, t1, cluster_tol=12.0):
         """items(수직선이면 x/y0/y1, 수평선이면 y/x0/x1)를 key값(같은 벽선이면
         거의 동일한 x 또는 y)이 cluster_tol 이내인 것끼리 한 벽으로 묶고, 그
         벽에 속한 (문턱/문틀 등으로 끊어진) 개별 선분들을 [t0,t1] 구간에
@@ -519,8 +525,9 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
                 clusters.append({'ref': it[key], 'key': it[key], 'items': [it]})
         result = []
         for c in clusters:
-            # 대표 좌표는 가장 긴 선의 좌표 — 처음 만난 선이나 근처의 다른 벽 조각에 끌려가지 않게 한다.
-            c['key'] = max(c['items'], key=lambda it: it[r1] - it[r0])[key]
+            # 대표 좌표는 대상 구간 [t0,t1]과 가장 많이 겹치는 선의 좌표 — 승강로와 무관한 먼 곳의 긴 선이나
+            # 처음 만난 선에 끌려가 몇 mm씩 어긋나는 것을 막는다.
+            c['key'] = max(c['items'], key=lambda it: max(0.0, min(it[r1], hi_t) - max(it[r0], lo_t)))[key]
             intervals = []
             for it in c['items']:
                 if (it[r1] - it[r0]) > max_len:
@@ -2765,7 +2772,7 @@ class ElevatorShaftReviewModule:
             if ranked:
                 name_cands = list(ucands)
             else:
-                cands = list(dict.fromkeys(name_cands + geo_cands))
+                cands = [l_ for l_ in dict.fromkeys(name_cands + geo_cands) if not _is_def_layer(l_)]
                 ranked = _rank_wall_layers(msp, clusters, cands)
             self._set_pct(45)
             info['scores'] = [(l, sc) for l, sc, _cv in ranked]
