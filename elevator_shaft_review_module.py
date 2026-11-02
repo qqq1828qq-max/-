@@ -119,7 +119,10 @@ def _hidden_layer_names(doc):
         for lay in doc.layers:
             try:
                 nm = lay.dxf.name
-                if lay.is_frozen() or not lay.is_on() or nm.split('$')[-1].strip().lower().startswith('defpoint'):
+                last_ = nm.split('$')[-1].strip().lower()
+                # 이전 분석 결과로 도면에 입힌 레이어(승강로 사이즈, SHAFT-nn)는 벽/심볼로 다시 읽지 않는다.
+                if (lay.is_frozen() or not lay.is_on() or last_.startswith('defpoint')
+                        or last_ == '승강로 사이즈' or re.fullmatch(r'shaft-\d+', last_)):
                     hidden.add(nm)
             except Exception:
                 continue
