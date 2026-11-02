@@ -3376,9 +3376,12 @@ class ElevatorShaftReviewModule:
             n_single = sum(1 for r in self.rows if r.get('layout') == self.LAYOUT_OPTIONS[0])
             n_par = sum(1 for r in self.rows if r.get('layout') == self.LAYOUT_OPTIONS[1])
             cap_counts = {}
+            n_nocap = 0
             for r in self.rows:
                 if r.get('cap') is not None:
                     cap_counts[r['cap']] = cap_counts.get(r['cap'], 0) + 1
+                else:
+                    n_nocap += 1
             ss = wb.create_sheet('집계')
             ss.merge_cells('A1:B1')
             ss['A1'] = f'{title} - 집계'
@@ -3389,13 +3392,15 @@ class ElevatorShaftReviewModule:
             ss.append(['총 승강기 대수', n_total])
             ss.append(['단독 대수', n_single])
             ss.append(['병렬 대수', n_par])
-            if cap_counts:
+            if cap_counts or n_nocap:
                 ss.append([])
                 ss.append(['인승별', '대수'])
                 for k in sorted(cap_counts):
                     ss.append([f'{k}인승', cap_counts[k]])
+                if n_nocap:
+                    ss.append(['정보 미제공', n_nocap])
             head_rows = {2}
-            if cap_counts:
+            if cap_counts or n_nocap:
                 head_rows.add(7)
             for r in range(2, ss.max_row + 1):
                 if all(ss.cell(row=r, column=ci).value is None for ci in (1, 2)):
