@@ -3021,6 +3021,17 @@ class ElevatorShaftReviewModule:
         except Exception:
             traceback.print_exc()
 
+        # 출력 기준: W/D를 도면 가로·세로 측정값과 반대로 내보낸다(사용 부서 요청). 모든 출력(미리보기·도면 라벨·검토표·엑셀)이
+        # 이 결과를 그대로 쓰므로 여기서 한 번만 바꾼다.
+        for r in results:
+            r['width_mm'], r['depth_mm'] = r['depth_mm'], r['width_mm']
+            pts_ = r.get('points')
+            if pts_ and len(pts_) == 4:
+                r['points'] = list(pts_[1:]) + [pts_[0]]     # sn.lsp는 폴리선 첫 변을 W, 둘째 변을 D로 읽는다
+            if r.get('bay_info'):
+                n_, bw_, bd_ = r['bay_info']
+                r['bay_info'] = (n_, bd_, bw_)
+
         # 미리보기·④·⑤가 같은 코어 번호를 쓰도록 라벨을 한 번에 부여한다.
         for idx, (label, parallel) in _assign_core_labels(results).items():
             results[idx - 1]['core_label'] = label
