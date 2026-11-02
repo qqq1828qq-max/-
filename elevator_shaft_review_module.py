@@ -2523,11 +2523,11 @@ class ElevatorShaftReviewModule:
         tk.Label(card, text='행을 클릭하면 아래 "3. 선택한 행 상세"에 근거(도면 파싱 출처)가 표시되고, 셀을 더블클릭하면 값을 직접 수정할 수 있습니다.',
                  font=FS, bg=SURFACE, fg=TEXT_MUTED).pack(anchor='w', pady=(4, 8))
 
-        cols = ['no', 'dong', 'core', 'cap', 'layout', 'act_w', 'act_d']
+        cols = ['no', 'core', 'cap', 'layout', 'act_w', 'act_d']
         headers = {
-            'no': 'No', 'dong': '동', 'core': '코어',
+            'no': 'No', 'core': '코어',
             'cap': '인승', 'layout': '배치',
-            'act_w': '실측W', 'act_d': '실측D',
+            'act_w': '실측W(mm)', 'act_d': '실측D(mm)',
         }
 
         tree_frame = tk.Frame(card, bg=SURFACE)
@@ -2538,8 +2538,8 @@ class ElevatorShaftReviewModule:
         for c in cols:
             self.tree.heading(c, text=headers[c])
             self.tree.column(c, width=70, anchor='center')
-        self.tree.column('dong', width=48)
-        self.tree.column('core', width=48)
+        self.tree.column('no', width=50)
+        self.tree.column('core', width=420, anchor='w')
 
         vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient='horizontal', command=self.tree.xview)
@@ -3076,13 +3076,7 @@ class ElevatorShaftReviewModule:
         # 같은 코어 번호 + 배치="병렬"로, 혼자인 승강로는 배치="단독"으로
         # 검토표에 반영한다(이전에는 전부 "단독"으로 잘못 표시됐었음).
         # 검토표는 누적하지 않는다 — 현재 도면의 결과만 담는다(여러 도면을 돌려도 이전 도면 행이 섞이지 않음).
-        # 사용자가 표에서 직접 입력한 '동' 구분이 있으면 지우기 전에 한 번 확인한다.
         if self.rows:
-            if any(r.get('dong') for r in self.rows) and not messagebox.askyesno(
-                    '검토표 교체',
-                    f'검토표에 있는 {len(self.rows)}행(직접 입력한 동 구분 포함)을 지우고\n'
-                    '현재 도면의 결과로 교체합니다. 계속할까요?'):
-                return None
             self.rows = []
             self._row_seq = 0
             for i in self.tree.get_children():
@@ -3103,7 +3097,7 @@ class ElevatorShaftReviewModule:
                 core=core_label, cap=r.get('capacity_guess'), layout=layout,
                 w=r.get('width_mm'), d=r.get('depth_mm'))
             n_added += 1
-        msg = f'✅ 확정 승강로 전체 검토표를 현재 도면 결과 {n_added}건으로 교체했습니다(동 구분은 직접 입력하세요).'
+        msg = f'✅ 확정 승강로 전체 검토표를 현재 도면 결과 {n_added}건으로 교체했습니다'
         if n_low_conf:
             msg += f' ⚠ {n_low_conf}건은 벽체 미검출(심볼 윤곽 크기)로 표시됨 — 도면에서 직접 확인 필요.'
         self.lbl_status.config(text=msg, fg=ACCENT_SUCCESS if not n_low_conf else ACCENT_WARNING)
@@ -3126,7 +3120,7 @@ class ElevatorShaftReviewModule:
         except ValueError:
             return None
 
-    def _add_detection_row(self, dong='', core='', cap=None, layout=None, w=None, d=None):
+    def _add_detection_row(self, dong='', core='', cap=None, layout=None, w=None, d=None):   # dong: 예전 프로젝트 호환용(무시)
         """지하주차장 승강로 탐지 결과(또는 저장된 세션 행) 하나를 "확정 승강로
         전체 검토표"에 행으로 추가한다. 예전에는 "2. 실측값 입력" 폼의 입력칸
         값을 읽어 행을 만들었지만, 이제는 탐지 결과(또는 세션 파일)에서 이미
@@ -3136,7 +3130,6 @@ class ElevatorShaftReviewModule:
         self._row_seq += 1
         row_data = {
             'no': self._row_seq,
-            'dong': dong or '',
             'core': core or '',
             'cap': int(cap) if cap not in (None, '') else None,
             'layout': layout or self.LAYOUT_OPTIONS[0],
@@ -3152,7 +3145,7 @@ class ElevatorShaftReviewModule:
     def _row_values(self, row_data):
         actual = row_data['actual']
         return [
-            row_data['no'], row_data['dong'], row_data['core'],
+            row_data['no'], row_data['core'],
             (row_data['cap'] if row_data['cap'] is not None else ''), row_data['layout'],
             self._fmt_val(actual['w']), self._fmt_val(actual['d']),
         ]
@@ -3168,7 +3161,7 @@ class ElevatorShaftReviewModule:
     # 편집을 기본 지원하지 않으므로, 더블클릭한 셀 위치에 Entry(또는 '구분'/
     # '배치' 컬럼은 Combobox)를 겹쳐 띄워 그 자리에서 값을 고치고 Enter/포커스
     # 아웃 시 self.rows와 화면 표시에 반영하는 방식으로 구현한다.
-    _EDITABLE_COLUMNS = {'dong', 'core', 'cap', 'layout', 'act_w', 'act_d'}
+    _EDITABLE_COLUMNS = {'core', 'cap', 'layout', 'act_w', 'act_d'}
     _ACTUAL_COLUMN_KEYS = {'act_w': 'w', 'act_d': 'd'}
 
     def _on_tree_double_click(self, event):
@@ -3264,7 +3257,7 @@ class ElevatorShaftReviewModule:
                     messagebox.showwarning('경고', '숫자로 입력하세요.')
                     return
                 row_data['actual'][key] = parsed
-        elif col_name in ('layout', 'dong', 'core'):
+        elif col_name in ('layout', 'core'):
             row_data[col_name] = new_val
 
         self.tree.item(row_iid, values=tuple(self._row_values(row_data)))
@@ -3288,7 +3281,7 @@ class ElevatorShaftReviewModule:
         actual = row_data['actual']
         cap_disp = row_data['cap'] if row_data['cap'] is not None else '(미입력)'
         lines = [
-            f"[No.{row_data['no']}] {row_data['dong']} {row_data['core']}  "
+            f"[No.{row_data['no']}] {row_data['core']}  "
             f"인승{cap_disp} / {row_data['layout']}",
             '',
             f"실측 폭(W)      : {self._fmt_val(actual['w'])} mm",
@@ -3321,31 +3314,100 @@ class ElevatorShaftReviewModule:
             return
         try:
             import openpyxl
-            from openpyxl.styles import Font, Alignment
+            from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+            from openpyxl.utils import get_column_letter
+
+            title = os.path.splitext(os.path.basename(path))[0]
+            thin = Side(style='thin', color='999999')
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            head_fill = PatternFill('solid', fgColor='D9E1F2')
+            title_font = Font(bold=True, size=14)
+            center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            left = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+            def _width(ws, ncols, first_row, min_w=8, max_w=70):
+                for ci in range(1, ncols + 1):
+                    L = get_column_letter(ci)
+                    longest = 0
+                    for r in range(first_row, ws.max_row + 1):
+                        v = ws.cell(row=r, column=ci).value
+                        if v is not None:
+                            # 한글은 영문보다 폭이 넓어 글자당 약 1.7배로 잡는다
+                            longest = max(longest, sum(1.7 if ord(ch) > 127 else 1.0 for ch in str(v)))
+                    ws.column_dimensions[L].width = max(min_w, min(max_w, longest + 3))
 
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = '승강로 CAD 도면 분석'
 
-            headers = ['No', '동', '코어', '인승', '배치',
-                       '실측W', '실측D']
+            headers = ['No', '코어', '인승', '배치', '실측W(mm)', '실측D(mm)']
+            ncols = len(headers)
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+            ws.cell(row=1, column=1, value=title).font = title_font
+            ws.cell(row=1, column=1).alignment = center
+            ws.row_dimensions[1].height = 28
             ws.append(headers)
-            for cell in ws[1]:
-                cell.font = Font(bold=True)
-                cell.alignment = Alignment(horizontal='center', wrap_text=True)
-
+            for ci in range(1, ncols + 1):
+                c = ws.cell(row=2, column=ci)
+                c.font = Font(bold=True)
+                c.alignment = center
+                c.fill = head_fill
+                c.border = border
             for row_data in self.rows:
                 actual = row_data['actual']
-                ws.append([
-                    row_data['no'], row_data['dong'], row_data['core'],
-                    row_data['cap'], row_data['layout'],
-                    actual['w'], actual['d'],
-                ])
+                ws.append([row_data['no'], row_data['core'], row_data['cap'], row_data['layout'],
+                           actual['w'], actual['d']])
+            for r in range(3, ws.max_row + 1):
+                for ci in range(1, ncols + 1):
+                    c = ws.cell(row=r, column=ci)
+                    c.border = border
+                    c.alignment = left if ci == 2 else center
+                    if ci in (5, 6) and c.value is not None:
+                        c.number_format = '#,##0.#'
+            _width(ws, ncols, 2)
+            ws.freeze_panes = 'A3'
+            ws.page_setup.orientation = 'landscape'
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
 
-            for col in ws.columns:
-                max_len = max((len(str(c.value)) for c in col if c.value is not None), default=8)
-                ws.column_dimensions[col[0].column_letter].width = max(8, min(28, max_len + 2))
-            ws.freeze_panes = 'A2'
+            # ── 집계표 시트 ──
+            n_total = len(self.rows)
+            n_single = sum(1 for r in self.rows if r.get('layout') == self.LAYOUT_OPTIONS[0])
+            n_par = sum(1 for r in self.rows if r.get('layout') == self.LAYOUT_OPTIONS[1])
+            cap_counts = {}
+            for r in self.rows:
+                if r.get('cap') is not None:
+                    cap_counts[r['cap']] = cap_counts.get(r['cap'], 0) + 1
+            ss = wb.create_sheet('집계')
+            ss.merge_cells('A1:B1')
+            ss['A1'] = f'{title} - 집계'
+            ss['A1'].font = title_font
+            ss['A1'].alignment = center
+            ss.row_dimensions[1].height = 28
+            ss.append(['구분', '대수'])
+            ss.append(['총 승강기 대수', n_total])
+            ss.append(['단독 대수', n_single])
+            ss.append(['병렬 대수', n_par])
+            if cap_counts:
+                ss.append([])
+                ss.append(['인승별', '대수'])
+                for k in sorted(cap_counts):
+                    ss.append([f'{k}인승', cap_counts[k]])
+            head_rows = {2}
+            if cap_counts:
+                head_rows.add(7)
+            for r in range(2, ss.max_row + 1):
+                if all(ss.cell(row=r, column=ci).value is None for ci in (1, 2)):
+                    continue
+                for ci in (1, 2):
+                    c = ss.cell(row=r, column=ci)
+                    c.border = border
+                    c.alignment = center
+                    if r in head_rows:
+                        c.font = Font(bold=True)
+                        c.fill = head_fill
+            _width(ss, 2, 2, min_w=14, max_w=30)
 
             wb.save(path)
             messagebox.showinfo('완료', f'검토 결과를 저장했습니다.\n{path}')
@@ -3360,7 +3422,7 @@ class ElevatorShaftReviewModule:
     SESSION_VERSION = 2
 
     def _serialize_row(self, r):
-        return {k: r.get(k) for k in ('dong', 'core', 'cap', 'layout', 'actual')}
+        return {k: r.get(k) for k in ('core', 'cap', 'layout', 'actual')}
 
     def _build_session_dict(self):
         """현재 진행 상태(검토 행 전체)를 JSON 저장용 dict로 만든다. 저장된 프로젝트를 열면 검토표가 그대로 복원된다."""
