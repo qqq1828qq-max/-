@@ -484,7 +484,7 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
         span = min(a1 - a0, b1 - b0)
         return span > 0 and ov / span >= min_ratio
 
-    def _cluster_coverage(items, key, r0, r1, t0, t1, cluster_tol=80.0):
+    def _cluster_coverage(items, key, r0, r1, t0, t1, cluster_tol=25.0):
         """items(수직선이면 x/y0/y1, 수평선이면 y/x0/x1)를 key값(같은 벽선이면
         거의 동일한 x 또는 y)이 cluster_tol 이내인 것끼리 한 벽으로 묶고, 그
         벽에 속한 (문턱/문틀 등으로 끊어진) 개별 선분들을 [t0,t1] 구간에
@@ -508,14 +508,16 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
         for it in items:
             placed = False
             for c in clusters:
-                if abs(it[key] - c['key']) <= cluster_tol:
+                if abs(it[key] - c['ref']) <= cluster_tol:
                     c['items'].append(it)
                     placed = True
                     break
             if not placed:
-                clusters.append({'key': it[key], 'items': [it]})
+                clusters.append({'ref': it[key], 'key': it[key], 'items': [it]})
         result = []
         for c in clusters:
+            # 대표 좌표는 가장 긴 선의 좌표 — 처음 만난 선이나 근처의 다른 벽 조각에 끌려가지 않게 한다.
+            c['key'] = max(c['items'], key=lambda it: it[r1] - it[r0])[key]
             intervals = []
             for it in c['items']:
                 if (it[r1] - it[r0]) > max_len:
