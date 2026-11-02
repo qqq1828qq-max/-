@@ -109,6 +109,46 @@ def _point_in_clip_stack(pt, clip_stack):
     return True
 
 
+def _clip_visible_pieces(a, b, clip_stack):
+    """선분 a→b 중 XCLIP(쌓인 모든 경계)에 '보이는' 부분만 [(p, q), ...] 조각으로 돌려준다.
+    클립이 없으면 [(a, b)] 그대로. 중점만 보고 통째로 살리거나 버리지 않고 경계에서 실제로 잘라낸다
+    (양개도어 승강기 블록의 한쪽을 XCLIP으로 숨겨 단방향으로 쓴 경우, 보이는 형상만으로 크기·문 방향을 읽기 위함)."""
+    if not clip_stack:
+        return [(a, b)]
+    pieces = [(a, b)]
+    for poly in clip_stack:
+        n = len(poly)
+        if n < 3:
+            continue
+        nxt = []
+        for p, q in pieces:
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            ts = [0.0, 1.0]
+            for i in range(n):
+                c, d = poly[i], poly[(i + 1) % n]
+                ex, ey = d[0] - c[0], d[1] - c[1]
+                den = dx * ey - dy * ex
+                if abs(den) < 1e-12:
+                    continue
+                t = ((c[0] - p[0]) * ey - (c[1] - p[1]) * ex) / den
+                u = ((c[0] - p[0]) * dy - (c[1] - p[1]) * dx) / den
+                if 0.0 < t < 1.0 and 0.0 <= u <= 1.0:
+                    ts.append(t)
+            ts.sort()
+            for t0, t1 in zip(ts, ts[1:]):
+                if t1 - t0 < 1e-9:
+                    continue
+                p0 = (p[0] + dx * t0, p[1] + dy * t0)
+                p1 = (p[0] + dx * t1, p[1] + dy * t1)
+                mid = ((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2)
+                if _point_in_clip_stack(mid, [poly]):
+                    nxt.append((p0, p1))
+        pieces = nxt
+        if not pieces:
+            break
+    return pieces
+
+
 def _hidden_layer_names(doc):
     """캐드 화면에 보이지 않는 레이어(동결 Freeze / 꺼짐 Off) 이름 집합. 이런 레이어에는 설계 정의용
     기준선(예: '0-Def-기준Wall')처럼 도면 사용자가 볼 수 없는 형상이 들어 있는 경우가 많다 — 실측: 동결된
@@ -165,7 +205,7 @@ def _wall_segment_candidates(msp, layer_hint='골조', max_block_depth=6):
             layer = e.dxf.layer or ''
         except Exception:
             return False
-        if layer in hidden or layer_hint not in layer:
+        if layer in hidden or layer != layer_hint:
             return False
         layer_upper = layer.upper()
         if any(tok.upper() in layer_upper for tok in _NON_WALL_LAYER_TOKENS):
@@ -196,9 +236,8 @@ def _wall_segment_candidates(msp, layer_hint='골조', max_block_depth=6):
             else:
                 return
             for a, b in pt_pairs:
-                cx, cy = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
-                if _point_in_clip_stack((cx, cy), clip_stack):
-                    segs.append((a[0], a[1], b[0], b[1]))
+                for p0, p1 in _clip_visible_pieces(a, b, clip_stack):
+                    segs.append((p0[0], p0[1], p1[0], p1[1]))
         except Exception:
             pass
 
@@ -370,9 +409,12 @@ def _rank_wall_layers(msp, clusters, candidates, max_block_depth: int = 6,
                 else:
                     continue
                 if len(pts) >= 2:
-                    mid = ((pts[0][0] + pts[-1][0]) / 2, (pts[0][1] + pts[-1][1]) / 2)
-                    if _point_in_clip_stack(mid, clip_stack):
+                    if not clip_stack:
                         _add(layer, pts)
+                    else:
+                        for k_ in range(len(pts) - 1):
+                            for p0, p1 in _clip_visible_pieces(pts[k_], pts[k_ + 1], clip_stack):
+                                _add(layer, [p0, p1])
             except Exception:
                 continue
 
@@ -1034,9 +1076,14 @@ def _geometry_x_fallback(msp, hidden, max_block_depth=6):
                         pts = [(c.x - r, c.y - r), (c.x + r, c.y + r)]
                     if len(pts) < 2:
                         continue
-                    mid = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
-                    if _point_in_clip_stack(mid, clip_stack):
-                        cb(et, layer, pts)
+                    if clip_stack and et != 'ARC':
+                        for k_ in range(len(pts) - 1):
+                            for p0, p1 in _clip_visible_pieces(pts[k_], pts[k_ + 1], clip_stack):
+                                cb(et, layer, [p0, p1])
+                    else:
+                        mid = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+                        if _point_in_clip_stack(mid, clip_stack):
+                            cb(et, layer, pts)
                 except Exception:
                     continue
 
@@ -1176,7 +1223,15 @@ def _find_shaft_points_by_layer(dxf_path: str, layer_keywords=SHAFT_LAYER_KEYWOR
                 # 결과 DXF를 다시 입력하면 심볼로 오인되므로 제외한다.
                 if layer != '승강로 사이즈' and (_layer_matches(layer) or (force and layer not in hidden)):
                     pts = _entity_points(e)
-                    if pts:
+                    if pts and clip_stack and etype != 'ARC' and len(pts) >= 2:
+                        # XCLIP으로 가려진 부분은 심볼에서 뺀다 — 경계에서 실제로 잘라 보이는 조각만 쓴다.
+                        for k_ in range(len(pts) - 1):
+                            for p0, p1 in _clip_visible_pieces(pts[k_], pts[k_ + 1], clip_stack):
+                                pp = [p0, p1]
+                                found.append(((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2,
+                                              min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1]),
+                                              pp, [(p0[0], p0[1], p1[0], p1[1])], layer))
+                    elif pts:
                         cx = sum(p[0] for p in pts) / len(pts)
                         cy = sum(p[1] for p in pts) / len(pts)
                         if _point_in_clip_stack((cx, cy), clip_stack):
