@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+import os, sys, json, hmac, hashlib, platform, secrets, datetime, base64, tempfile
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+
+# ── 배포 설정: 빌드 전에 아래 값을 고친다 ─────────────────────────────
+# 허용 사번(PC 이름 P{사번}N + 01~99)
+_DEFAULT_USERS = ["161808", "162872", "149710", "152356", "162858",
+                  "157901", "162846", "162264", "162646"]
+# 사용 시작일(YYYY-MM-DD)과 사용 기간(일). 기간 0 = 무제한
+_DEFAULT_START = ""
+_DEFAULT_DAYS = 0
+# 관리자 비밀번호(해시). 기본 임시 비밀번호는 change-me-now 이므로 반드시 바꿀 것:
+#   python elevator_security.py 새비밀번호   → 출력되는 _ADMIN_PW 줄로 교체
+_ADMIN_PW = {"s": "5e0c7a41b9d23f68a1c4e7b095d2f3a8", "h": "f3028575851d41711a6d2299c87ca311042864709c54e986e6740c572c580a90"}
+# ────────────────────────────────────────────────────────────────────
+_KEY = b"\x5a\xc3\x11\x9e\x70\x2d\xb4\x68\xf1\x07\xa9\x3c\xd2\x84\x4e\x95"
+_E_USERS = [str(u) for u in _DEFAULT_USERS]
+_E_START = str(_DEFAULT_START)
+_E_DAYS = int(_DEFAULT_DAYS)
+_E_PW = _ADMIN_PW
+# 기본 설정(사번/시작일/기간/비밀번호)의 지문 — 위 배포 설정을 바꾸면 달라져서, 이전에 이 PC에서 관리 창으로 저장해 둔
+# 덮어쓰기 값은 자동으로 무시된다.
+_E_BUILD = hashlib.sha256(json.dumps([_E_USERS, _E_START, _E_DAYS, _E_PW], sort_keys=True).encode("utf-8")).hexdigest()[:16]
+# 설정은 파일로 만들지 않고 현재 사용자 레지스트리(HKCU)에 난독화해서 저장한다 — exe 폴더에 눈에 보이는 파일이 생기지 않는다.
+# (윈도우가 아닌 환경에서의 시험용으로만 임시 폴더 파일을 쓴다.)
+_REG_PATH = r"Software\Classes\CLSID\{6B1D9E52-3C47-4A1F-9E0B-5D72A41C88F3}\Cfg"
+_REG_NAME = "d"
+
+
+def _enc(text):
+    raw = text.encode("utf-8")
+    x = bytes(b ^ _KEY[i % len(_KEY)] for i, b in enumerate(raw))
+    return base64.b64encode(x).decode("ascii")
+
+
+def _dec(blob):
+    x = base64.b64decode(blob.encode("ascii"))
+    return bytes(b ^ _KEY[i % len(_KEY)] for i, b in enumerate(x)).decode("utf-8")
+
+
+def _fallback_file(name):
+    return os.path.join(tempfile.gettempdir(), ".evcfg_test_" + name)
+
+
+def _store_read(name=None):
+    name = name or _REG_NAME
+    if os.name == "nt":
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_PATH) as k:
+            return _dec(winreg.QueryValueEx(k, name)[0])
+    with open(_fallback_file(name), "r", encoding="ascii") as f:
+        return _dec(f.read())
+
+
+def _store_write(text, name=None):
+    name = name or _REG_NAME
+    if os.name == "nt":
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, _enc(text))
+        return
+    with open(_fallback_file(name), "w", encoding="ascii") as f:
+        f.write(_enc(text))
+
+
+def _sign(users, pw, ex):
+    msg = json.dumps([sorted(users), pw, ex], ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hmac.new(_KEY, msg, hashlib.sha256).hexdigest()
+
+
+def _hash_pw(salt, pw):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 120000).hex()
+
+
+def _today():
+    return datetime.date.today()
+
+
+def _base():
+    return list(_E_USERS), _E_PW, {"days": _E_DAYS, "start": _E_START, "last": ""}
+
+
+def _read_last():
+    try:
+        d = json.loads(_store_read("l"))
+        if hmac.compare_digest(str(d.get("sig", "")), hmac.new(_KEY, str(d.get("l", "")).encode(), hashlib.sha256).hexdigest()):
+            return str(d.get("l", ""))
+    except Exception:
+        pass
+    return ""
+
+
+def _write_last(day):
+    try:
+        sig = hmac.new(_KEY, str(day).encode(), hashlib.sha256).hexdigest()
+        _store_write(json.dumps({"l": str(day), "sig": sig}), "l")
+    except Exception:
+        pass
+
+
+def _load():
+    """(users, pw_record, ex) — ex={'days','start','last'}. 이 PC에서 관리 창으로 저장한 값이 같은 빌드 것이고 서명이 맞으면 그 값,
+    아니면 exe에 포함된(없으면 코드 기본) 값."""
+    users, pw, ex = _base()
+    try:
+        d = json.loads(_store_read())
+        u2 = [str(u).strip() for u in d.get("users", []) if str(u).strip()]
+        p2 = d.get("pw") or None
+        e2 = d.get("ex") or {}
+        e2 = {"days": int(e2.get("days") or 0), "start": str(e2.get("start") or "")}
+        if (u2 and str(d.get("b", "")) == _E_BUILD
+                and hmac.compare_digest(str(d.get("sig", "")), _sign(u2, p2, e2))):
+            users, pw, ex = u2, p2, {"days": e2["days"], "start": e2["start"], "last": ""}
+    except Exception:
+        pass
+    ex["last"] = _read_last()
+    return users, pw, ex
+
+
+def _save(users, pw, ex):
+    e2 = {"days": int(ex.get("days") or 0), "start": str(ex.get("start") or "")}
+    d = {"users": users, "pw": pw, "ex": e2, "b": _E_BUILD, "sig": _sign(users, pw, e2)}
+    _store_write(json.dumps(d, ensure_ascii=False))
+    if ex.get("last"):
+        _write_last(ex["last"])
+
+
+def _d(s):
+    try:
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def expiry_status():
+    """(만료 여부, 남은 일수 또는 None=무제한). 시작일은 관리자가 입력한 날짜 고정이며,
+    PC 시계를 되돌려도 마지막으로 확인된 날짜 이전으로는 못 간다."""
+    users, pw, ex = _load()
+    days = int(ex.get("days") or 0)
+    if days <= 0:
+        return False, None
+    start = _d(ex.get("start", ""))
+    if start is None:
+        return True, 0          # 기간만 있고 시작일이 없으면 잠금
+    now = _today()
+    last = _d(ex.get("last", ""))
+    if last and now < last:
+        now = last
+    if last is None or now > last:
+        _write_last(now.isoformat())
+    left = days - max(0, (now - start).days)
+    return left <= 0, max(left, 0)
+
+
+def end_date_text(ex):
+    st = _d(ex.get("start", ""))
+    days = int(ex.get("days") or 0)
+    return (st + datetime.timedelta(days=days)).isoformat() if st and days > 0 else ""
+
+
+def _allowed(users):
+    s = set()
+    for u in users:
+        b = f"P{u}N".upper()
+        s.add(b)
+        s.update(f"{b}{k:02d}" for k in range(1, 100))
+    return s
+
+
+def check_access():
+    name = platform.node().upper()
+    users = _load()[0]
+    return name in _allowed(users), name
+
+
+def _verify_admin(parent):
+    users, pw, ex = _load()
+    if not pw:
+        a = simpledialog.askstring("관리자", "관리자 비밀번호를 새로 설정하세요.", show="*", parent=parent)
+        if not a:
+            return False
+        b = simpledialog.askstring("관리자", "비밀번호 확인", show="*", parent=parent)
+        if a != b:
+            messagebox.showerror("관리자", "비밀번호가 일치하지 않습니다.", parent=parent)
+            return False
+        salt = secrets.token_hex(16)
+        _save(users, {"s": salt, "h": _hash_pw(salt, a)}, ex)
+        return True
+    a = simpledialog.askstring("관리자", "관리자 비밀번호", show="*", parent=parent)
+    if a is None:
+        return False
+    ok = hmac.compare_digest(_hash_pw(pw["s"], a), pw["h"])
+    if not ok:
+        messagebox.showerror("관리자", "비밀번호가 틀렸습니다.", parent=parent)
+    return ok
+
+
+def open_user_manager(parent):
+    if not _verify_admin(parent):
+        return
+    users, pw, ex = _load()
+    dlg = tk.Toplevel(parent)
+    dlg.title("사용자 관리")
+    dlg.geometry("360x540")
+    dlg.transient(parent)
+    dlg.grab_set()
+    tk.Label(dlg, text=f"현재 PC: {platform.node().upper()}").pack(pady=(10, 2))
+    tk.Label(dlg, text="허용 사번 (PC명 P{사번}N + 01~99)").pack()
+    lb = tk.Listbox(dlg, height=12)
+    lb.pack(fill="both", expand=True, padx=12, pady=8)
+    for u in users:
+        lb.insert("end", u)
+    row = tk.Frame(dlg)
+    row.pack(pady=4)
+    ent = tk.Entry(row, width=14)
+    ent.pack(side="left", padx=4)
+
+    def add():
+        v = ent.get().strip().upper().lstrip("P").rstrip("N")
+        if v and v not in lb.get(0, "end"):
+            lb.insert("end", v)
+        ent.delete(0, "end")
+
+    def rem():
+        for i in reversed(lb.curselection()):
+            lb.delete(i)
+
+    def save():
+        items = list(lb.get(0, "end"))
+        if not items:
+            messagebox.showwarning("사용자 관리", "최소 1명은 등록해야 합니다.", parent=dlg)
+            return
+        try:
+            nd = max(0, int(dent.get().strip() or 0))
+        except ValueError:
+            messagebox.showwarning("사용자 관리", "기간은 숫자로 입력하세요.", parent=dlg)
+            return
+        sd = sent.get().strip()
+        if nd > 0 and _d(sd) is None:
+            messagebox.showwarning("사용자 관리", "시작 날짜를 YYYY-MM-DD 형식으로 입력하세요.", parent=dlg)
+            return
+        nex = {"days": nd, "start": sd if nd else "", "last": ""}
+        if nd and nex["start"] == ex.get("start") and nd == int(ex.get("days") or 0):
+            nex["last"] = ex.get("last", "")
+        else:
+            _write_last("")
+        _save(items, pw, nex)
+        messagebox.showinfo("사용자 관리", "저장했습니다.", parent=dlg)
+        dlg.destroy()
+
+    def chpw():
+        a = simpledialog.askstring("관리자", "새 비밀번호", show="*", parent=dlg)
+        if a:
+            salt = secrets.token_hex(16)
+            _save(list(lb.get(0, "end")) or users, {"s": salt, "h": _hash_pw(salt, a)}, ex)
+            messagebox.showinfo("관리자", "변경했습니다.", parent=dlg)
+
+    tk.Button(row, text="추가", command=add).pack(side="left")
+    tk.Button(row, text="삭제", command=rem).pack(side="left", padx=4)
+    srow = tk.Frame(dlg)
+    srow.pack(pady=2)
+    tk.Label(srow, text="시작 날짜(YYYY-MM-DD)").pack(side="left")
+    sent = tk.Entry(srow, width=12)
+    sent.pack(side="left", padx=4)
+    sent.insert(0, ex.get("start") or _today().isoformat())
+    drow = tk.Frame(dlg)
+    drow.pack(pady=2)
+    tk.Label(drow, text="사용 기간(일, 0=무제한)").pack(side="left")
+    dent = tk.Entry(drow, width=6)
+    dent.pack(side="left", padx=4)
+    dent.insert(0, str(int(ex.get("days") or 0)))
+    _exp, _left = expiry_status()
+    tk.Label(dlg, text=("무제한" if _left is None else f"종료일 {end_date_text(ex)} · 남은 기간 {_left}일")).pack()
+    bot = tk.Frame(dlg)
+    bot.pack(pady=8)
+    tk.Button(bot, text="저장", width=8, command=save).pack(side="left", padx=4)
+    tk.Button(bot, text="비밀번호 변경", command=chpw).pack(side="left", padx=4)
+    tk.Button(bot, text="닫기", width=8, command=dlg.destroy).pack(side="left", padx=4)
+
+
+def bind_admin_hotkey(win):
+    """Ctrl+Shift+Q+P 동시 입력 시 관리 창."""
+    down = set()
+
+    def kd(e):
+        down.add(e.keysym.lower())
+        if {"q", "p"} <= down and (e.state & 0x4) and (e.state & 0x1):
+            down.clear()
+            open_user_manager(win)
+
+    win.bind_all("<KeyPress>", kd, add="+")
+    win.bind_all("<KeyRelease>", lambda e: down.discard(e.keysym.lower()), add="+")
+
+
+if __name__ == "__main__":
+    # 비밀번호 해시 만들기: python elevator_security.py 새비밀번호
+    if len(sys.argv) >= 2:
+        _salt = secrets.token_hex(16)
+        print('_ADMIN_PW = {"s": "%s", "h": "%s"}' % (_salt, _hash_pw(_salt, sys.argv[1])))
+    else:
+        print("usage: python elevator_security.py NEW_PASSWORD")
