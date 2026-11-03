@@ -3,29 +3,25 @@ import os, sys, json, hmac, hashlib, platform, secrets, datetime, base64, tempfi
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
+# ── 배포 설정: 빌드 전에 아래 값을 고친다 ─────────────────────────────
+# 허용 사번(PC 이름 P{사번}N + 01~99)
 _DEFAULT_USERS = ["161808", "162872", "149710", "152356", "162858",
                   "157901", "162846", "162264", "162646"]
-_KEY = b"\x5a\xc3\x11\x9e\x70\x2d\xb4\x68\xf1\x07\xa9\x3c\xd2\x84\x4e\x95"
-# 설정 파일이 없거나 변조됐을 때 쓰는 내장 기간(빌드 전에 지정: 예 "2026-11-01", 90). 비워두면 무제한.
+# 사용 시작일(YYYY-MM-DD)과 사용 기간(일). 기간 0 = 무제한
 _DEFAULT_START = ""
 _DEFAULT_DAYS = 0
-
-# 빌드 때 admin_config.txt로부터 만들어지는 elevator_embedded.py(사번/시작일/기간/비밀번호 해시)가 있으면 exe 안에 포함돼
-# 모든 PC에 같은 설정이 적용된다. 없으면 위 기본값을 쓴다.
-try:
-    import elevator_embedded as _emb
-except Exception:
-    _emb = None
-_E_USERS = [str(u) for u in getattr(_emb, "USERS", _DEFAULT_USERS)]
-_E_START = str(getattr(_emb, "START", _DEFAULT_START))
-_E_DAYS = int(getattr(_emb, "DAYS", _DEFAULT_DAYS))
-_E_PW = getattr(_emb, "PW", None)
-_E_BUILD = hashlib.sha256(json.dumps([_E_USERS, _E_START, _E_DAYS, _E_PW, str(getattr(_emb, "BUILD", ""))],
-                                      sort_keys=True).encode("utf-8")).hexdigest()[:16]
-# _E_BUILD: 기본 설정(사번/시작일/기간/비밀번호)의 지문 — 코드의 기본값이나 admin_config.txt를 바꾸면 달라져서,
-# 이전에 이 PC에서 관리 창으로 저장해 둔 덮어쓰기 값은 자동으로 무시된다.
-
-
+# 관리자 비밀번호(해시). 기본 임시 비밀번호는 change-me-now 이므로 반드시 바꿀 것:
+#   python elevator_security.py 새비밀번호   → 출력되는 _ADMIN_PW 줄로 교체
+_ADMIN_PW = {"s": "5e0c7a41b9d23f68a1c4e7b095d2f3a8", "h": "f3028575851d41711a6d2299c87ca311042864709c54e986e6740c572c580a90"}
+# ────────────────────────────────────────────────────────────────────
+_KEY = b"\x5a\xc3\x11\x9e\x70\x2d\xb4\x68\xf1\x07\xa9\x3c\xd2\x84\x4e\x95"
+_E_USERS = [str(u) for u in _DEFAULT_USERS]
+_E_START = str(_DEFAULT_START)
+_E_DAYS = int(_DEFAULT_DAYS)
+_E_PW = _ADMIN_PW
+# 기본 설정(사번/시작일/기간/비밀번호)의 지문 — 위 배포 설정을 바꾸면 달라져서, 이전에 이 PC에서 관리 창으로 저장해 둔
+# 덮어쓰기 값은 자동으로 무시된다.
+_E_BUILD = hashlib.sha256(json.dumps([_E_USERS, _E_START, _E_DAYS, _E_PW], sort_keys=True).encode("utf-8")).hexdigest()[:16]
 # 설정은 파일로 만들지 않고 현재 사용자 레지스트리(HKCU)에 난독화해서 저장한다 — exe 폴더에 눈에 보이는 파일이 생기지 않는다.
 # (윈도우가 아닌 환경에서의 시험용으로만 임시 폴더 파일을 쓴다.)
 _REG_PATH = r"Software\Classes\CLSID\{6B1D9E52-3C47-4A1F-9E0B-5D72A41C88F3}\Cfg"
@@ -295,3 +291,12 @@ def bind_admin_hotkey(win):
 
     win.bind_all("<KeyPress>", kd, add="+")
     win.bind_all("<KeyRelease>", lambda e: down.discard(e.keysym.lower()), add="+")
+
+
+if __name__ == "__main__":
+    # 비밀번호 해시 만들기: python elevator_security.py 새비밀번호
+    if len(sys.argv) >= 2:
+        _salt = secrets.token_hex(16)
+        print('_ADMIN_PW = {"s": "%s", "h": "%s"}' % (_salt, _hash_pw(_salt, sys.argv[1])))
+    else:
+        print("usage: python elevator_security.py NEW_PASSWORD")

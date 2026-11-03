@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 echo [1/4] Checking required files
 set MISSING=0
-for %%F in (elevator_review_app.py elevator_shaft_review_module.py elevator_security.py designhub_ui_theme.py make_embedded.py) do (
+for %%F in (elevator_review_app.py elevator_shaft_review_module.py elevator_security.py designhub_ui_theme.py) do (
   if not exist "%%F" (
     echo   MISSING: %%F
     set MISSING=1
@@ -23,16 +23,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-
-echo [2.5/4] Embedding admin settings from admin_config.txt
-python make_embedded.py
-if errorlevel 1 (
-  echo Fix admin_config.txt and run again
-  pause
-  exit /b 1
-)
-set EMB=
-if exist elevator_embedded.py set EMB=--include-module=elevator_embedded
 
 echo [3/4] Building - folder mode. If asked to download a C compiler, answer y. It can take 10-30 minutes.
 if exist dist\ElevatorReview rmdir /s /q dist\ElevatorReview
@@ -62,7 +52,6 @@ python -m nuitka --standalone --assume-yes-for-downloads ^
   --include-module=elevator_shaft_review_module ^
   --include-module=elevator_security ^
   --include-module=designhub_ui_theme ^
-  %EMB% ^
   --output-filename=ElevatorReview.exe ^
   --output-dir=dist ^
   elevator_review_app.py
@@ -79,5 +68,5 @@ ren dist\elevator_review_app.dist ElevatorReview
 echo.
 echo DONE: dist\ElevatorReview folder - run ElevatorReview.exe inside it.
 echo Distribute the whole folder.
-echo Admin settings are inside the exe from admin_config.txt. Do not distribute admin_config.txt or elevator_embedded.py.
+echo Users, period and admin password are set in elevator_security.py before building.
 pause

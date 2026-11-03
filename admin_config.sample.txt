@@ -1,6 +1,0 @@
-# Copy this file to admin_config.txt (next to build_nuitka.bat) and edit.
-# admin_config.txt is used only at build time - do NOT distribute it.
-users=161808,162872,149710,152356,162858,157901,162846,162264,162646
-start=2026-11-03
-days=90
-password=change-this-password
