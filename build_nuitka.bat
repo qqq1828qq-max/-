@@ -34,6 +34,21 @@ python -m nuitka --standalone --assume-yes-for-downloads ^
   --python-flag=no_docstrings --python-flag=-O ^
   --include-package=ezdxf ^
   --include-package=openpyxl ^
+  --nofollow-import-to=ezdxf.addons ^
+  --nofollow-import-to=openpyxl.utils.dataframe ^
+  --nofollow-import-to=pandas ^
+  --nofollow-import-to=scipy ^
+  --nofollow-import-to=matplotlib ^
+  --nofollow-import-to=PIL ^
+  --nofollow-import-to=pymupdf ^
+  --nofollow-import-to=fitz ^
+  --nofollow-import-to=sqlalchemy ^
+  --nofollow-import-to=xlsxwriter ^
+  --nofollow-import-to=jinja2 ^
+  --nofollow-import-to=PySide6 ^
+  --nofollow-import-to=PyQt5 ^
+  --nofollow-import-to=PyQt6 ^
+  --lto=no ^
   --include-module=elevator_shaft_review_module ^
   --include-module=elevator_security ^
   --include-module=designhub_ui_theme ^
