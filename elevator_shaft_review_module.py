@@ -595,7 +595,15 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
                     merged.append((lo, hi))
             covered = sum(hi - lo for lo, hi in merged)
             ratio = covered / target_len if target_len > 0 else 0.0
-            result.append({'key': c['key'], 'ratio': ratio})
+            # 클리핑하지 않은 전체 길이 구간(겹치거나 맞닿은 선을 이음) — 옆벽 끝점으로 다른 벽 위치를 추정하는 데 쓴다
+            full = sorted((it[r0], it[r1]) for it in c['items'] if (it[r1] - it[r0]) <= max_len)
+            full_m = []
+            for lo, hi in full:
+                if full_m and lo <= full_m[-1][1] + 30.0:
+                    full_m[-1] = (full_m[-1][0], max(full_m[-1][1], hi))
+                else:
+                    full_m.append((lo, hi))
+            result.append({'key': c['key'], 'ratio': ratio, 'full': full_m})
         return result
 
     def _pick_side(coverage_list, center, min_ratio, side):
@@ -637,6 +645,46 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
         right_x0 = _pick_side(vcov0, cx, strict_overlap_ratio, 'high')
         bottom_y0 = _pick_side(hcov0, cy, strict_overlap_ratio, 'low')
         top_y0 = _pick_side(hcov0, cy, strict_overlap_ratio, 'high')
+
+        # 문 개구부로 끊겨 기준 비율을 못 넘기는 문 쪽 벽 때문에 엉뚱한 먼 벽이 뽑히는 것을 막는다: 확정된 두 옆벽의 끝점이
+        # 서로 같은 위치에서 끝나면 그 끝점이 이웃 벽(문 벽/맞은편 벽)의 안쪽 면이다. 그 위치에 실제 선이 있으면(25%) 그 선을 쓴다.
+        def _span_at(cov, key_val, mid):
+            for c_ in cov:
+                if abs(c_['key'] - key_val) < 1e-6:
+                    for lo_, hi_ in c_.get('full', []):
+                        if lo_ - 5.0 <= mid <= hi_ + 5.0:
+                            return lo_, hi_
+            return None
+
+        def _near_line(cov, pos, tol=40.0):
+            best_ = None
+            for c_ in cov:
+                if abs(c_['key'] - pos) <= tol and c_['ratio'] >= 0.25 and (best_ is None or abs(c_['key'] - pos) < abs(best_ - pos)):
+                    best_ = c_['key']
+            return best_
+
+        if left_x0 is not None and right_x0 is not None:
+            sl, sr = _span_at(vcov0, left_x0, cy), _span_at(vcov0, right_x0, cy)
+            if sl and sr:
+                if abs(sl[0] - sr[0]) <= 60.0:
+                    cand_b = _near_line(hcov0, (sl[0] + sr[0]) / 2)
+                    if cand_b is not None and (bottom_y0 is None or abs(cand_b - cy) < abs(bottom_y0 - cy) - 60.0):
+                        bottom_y0 = cand_b
+                if abs(sl[1] - sr[1]) <= 60.0:
+                    cand_t = _near_line(hcov0, (sl[1] + sr[1]) / 2)
+                    if cand_t is not None and (top_y0 is None or abs(cand_t - cy) < abs(top_y0 - cy) - 60.0):
+                        top_y0 = cand_t
+        if bottom_y0 is not None and top_y0 is not None:
+            sb, st = _span_at(hcov0, bottom_y0, cx), _span_at(hcov0, top_y0, cx)
+            if sb and st:
+                if abs(sb[0] - st[0]) <= 60.0:
+                    cand_l = _near_line(vcov0, (sb[0] + st[0]) / 2)
+                    if cand_l is not None and (left_x0 is None or abs(cand_l - cx) < abs(left_x0 - cx) - 60.0):
+                        left_x0 = cand_l
+                if abs(sb[1] - st[1]) <= 60.0:
+                    cand_r = _near_line(vcov0, (sb[1] + st[1]) / 2)
+                    if cand_r is not None and (right_x0 is None or abs(cand_r - cx) < abs(right_x0 - cx) - 60.0):
+                        right_x0 = cand_r
 
         if bottom_y0 is not None and top_y0 is not None:
             vcov1 = _cluster_coverage(verticals, 'x', 'y0', 'y1', bottom_y0, top_y0)
