@@ -109,6 +109,14 @@ def _point_in_clip_stack(pt, clip_stack):
     return True
 
 
+def _point_in_polygon(pt, poly):
+    try:
+        from ezdxf.math import Vec2, is_point_in_polygon_2d
+        return is_point_in_polygon_2d(Vec2(pt[0], pt[1]), [Vec2(x, y) for x, y in poly]) >= 0
+    except Exception:
+        return False
+
+
 def _clip_visible_pieces(a, b, clip_stack):
     """선분 a→b 중 XCLIP(쌓인 모든 경계)에 '보이는' 부분만 [(p, q), ...] 조각으로 돌려준다.
     클립이 없으면 [(a, b)] 그대로. 중점만 보고 통째로 살리거나 버리지 않고 경계에서 실제로 잘라낸다
@@ -652,6 +660,16 @@ def _snap_bbox_to_wall_segs(segs, guess_bbox_world, layer_hint: str = '골조',
         if top_y is None:
             top_y = top_y0
 
+        # 네 면 중 한 면만 기준 비율을 못 넘기면(문 개구부로 벽이 반 가까이 끊긴 문 쪽 면) 그 면만 기준을 낮춰(30%)
+        # 다시 고른다. 나머지 세 면이 확정된 상태라 엉뚱한 선을 고를 위험이 작다.
+        sides = {'L': left_x, 'R': right_x, 'B': bottom_y, 'T': top_y}
+        miss = [k for k, v in sides.items() if v is None]
+        if len(miss) == 1:
+            k = miss[0]
+            relaxed = {'L': (vcov1, cx, 'low'), 'R': (vcov1, cx, 'high'),
+                       'B': (hcov1, cy, 'low'), 'T': (hcov1, cy, 'high')}[k]
+            sides[k] = _pick_side(relaxed[0], relaxed[1], 0.30, relaxed[2])
+            left_x, right_x, bottom_y, top_y = sides['L'], sides['R'], sides['B'], sides['T']
         if left_x is None or right_x is None or bottom_y is None or top_y is None:
             return None
         return left_x, right_x, bottom_y, top_y
@@ -3016,6 +3034,13 @@ class ElevatorShaftReviewModule:
                 snapped = _snap_bbox_to_wall_segs_any_angle(segs, bbox, layer_hint=wl,
                                                              max_reach_mm=max_reach_mm,
                                                              strict_overlap_ratio=0.5)
+                if not snapped and max_reach_mm is not None:
+                    # 이웃 승강로와 가까워 검색 범위를 제한하면 벽이 범위 밖에 놓이는 경우(깊이가 긴 승강로) — 제한 없이
+                    # 다시 찾되, 결과 사각형 안에 다른 승강로 중심이 들어오면 옆 승강로 벽을 집은 것이므로 버린다.
+                    again = _snap_bbox_to_wall_segs_any_angle(segs, bbox, layer_hint=wl, strict_overlap_ratio=0.5)
+                    if again and not any(_point_in_polygon(centers[j], again['points'])
+                                         for j in range(len(centers)) if j != i - 1):
+                        snapped = again
                 if snapped:
                     used_layer = wl
                     break
