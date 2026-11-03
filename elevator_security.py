@@ -10,6 +10,18 @@ _KEY = b"\x5a\xc3\x11\x9e\x70\x2d\xb4\x68\xf1\x07\xa9\x3c\xd2\x84\x4e\x95"
 _DEFAULT_START = ""
 _DEFAULT_DAYS = 0
 
+# 빌드 때 admin_config.txt로부터 만들어지는 elevator_embedded.py(사번/시작일/기간/비밀번호 해시)가 있으면 exe 안에 포함돼
+# 모든 PC에 같은 설정이 적용된다. 없으면 위 기본값을 쓴다.
+try:
+    import elevator_embedded as _emb
+except Exception:
+    _emb = None
+_E_USERS = [str(u) for u in getattr(_emb, "USERS", _DEFAULT_USERS)]
+_E_START = str(getattr(_emb, "START", _DEFAULT_START))
+_E_DAYS = int(getattr(_emb, "DAYS", _DEFAULT_DAYS))
+_E_PW = getattr(_emb, "PW", None)
+_E_BUILD = str(getattr(_emb, "BUILD", ""))
+
 
 # 설정은 파일로 만들지 않고 현재 사용자 레지스트리(HKCU)에 난독화해서 저장한다 — exe 폴더에 눈에 보이는 파일이 생기지 않는다.
 # (윈도우가 아닌 환경에서의 시험용으로만 임시 폴더 파일을 쓴다.)
@@ -28,26 +40,28 @@ def _dec(blob):
     return bytes(b ^ _KEY[i % len(_KEY)] for i, b in enumerate(x)).decode("utf-8")
 
 
-def _fallback_file():
-    return os.path.join(tempfile.gettempdir(), ".evcfg_test")
+def _fallback_file(name):
+    return os.path.join(tempfile.gettempdir(), ".evcfg_test_" + name)
 
 
-def _store_read():
+def _store_read(name=None):
+    name = name or _REG_NAME
     if os.name == "nt":
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_PATH) as k:
-            return _dec(winreg.QueryValueEx(k, _REG_NAME)[0])
-    with open(_fallback_file(), "r", encoding="ascii") as f:
+            return _dec(winreg.QueryValueEx(k, name)[0])
+    with open(_fallback_file(name), "r", encoding="ascii") as f:
         return _dec(f.read())
 
 
-def _store_write(text):
+def _store_write(text, name=None):
+    name = name or _REG_NAME
     if os.name == "nt":
         import winreg
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k, _REG_NAME, 0, winreg.REG_SZ, _enc(text))
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, _enc(text))
         return
-    with open(_fallback_file(), "w", encoding="ascii") as f:
+    with open(_fallback_file(name), "w", encoding="ascii") as f:
         f.write(_enc(text))
 
 
@@ -64,23 +78,53 @@ def _today():
     return datetime.date.today()
 
 
-def _load():
-    """(users, pw_record, ex) — ex={'days','start','last'}. 파일이 없거나 변조되면 기본값."""
+def _base():
+    return list(_E_USERS), _E_PW, {"days": _E_DAYS, "start": _E_START, "last": ""}
+
+
+def _read_last():
     try:
-        d = json.loads(_store_read())
-        users = [str(u).strip() for u in d.get("users", []) if str(u).strip()]
-        pw = d.get("pw") or None
-        ex = d.get("ex") or {"days": _DEFAULT_DAYS, "start": _DEFAULT_START, "last": ""}
-        if users and hmac.compare_digest(str(d.get("sig", "")), _sign(users, pw, ex)):
-            return users, pw, ex
+        d = json.loads(_store_read("l"))
+        if hmac.compare_digest(str(d.get("sig", "")), hmac.new(_KEY, str(d.get("l", "")).encode(), hashlib.sha256).hexdigest()):
+            return str(d.get("l", ""))
     except Exception:
         pass
-    return list(_DEFAULT_USERS), None, {"days": _DEFAULT_DAYS, "start": _DEFAULT_START, "last": ""}
+    return ""
+
+
+def _write_last(day):
+    try:
+        sig = hmac.new(_KEY, str(day).encode(), hashlib.sha256).hexdigest()
+        _store_write(json.dumps({"l": str(day), "sig": sig}), "l")
+    except Exception:
+        pass
+
+
+def _load():
+    """(users, pw_record, ex) — ex={'days','start','last'}. 이 PC에서 관리 창으로 저장한 값이 같은 빌드 것이고 서명이 맞으면 그 값,
+    아니면 exe에 포함된(없으면 코드 기본) 값."""
+    users, pw, ex = _base()
+    try:
+        d = json.loads(_store_read())
+        u2 = [str(u).strip() for u in d.get("users", []) if str(u).strip()]
+        p2 = d.get("pw") or None
+        e2 = d.get("ex") or {}
+        e2 = {"days": int(e2.get("days") or 0), "start": str(e2.get("start") or "")}
+        if (u2 and str(d.get("b", "")) == _E_BUILD
+                and hmac.compare_digest(str(d.get("sig", "")), _sign(u2, p2, e2))):
+            users, pw, ex = u2, p2, {"days": e2["days"], "start": e2["start"], "last": ""}
+    except Exception:
+        pass
+    ex["last"] = _read_last()
+    return users, pw, ex
 
 
 def _save(users, pw, ex):
-    d = {"users": users, "pw": pw, "ex": ex, "sig": _sign(users, pw, ex)}
+    e2 = {"days": int(ex.get("days") or 0), "start": str(ex.get("start") or "")}
+    d = {"users": users, "pw": pw, "ex": e2, "b": _E_BUILD, "sig": _sign(users, pw, e2)}
     _store_write(json.dumps(d, ensure_ascii=False))
+    if ex.get("last"):
+        _write_last(ex["last"])
 
 
 def _d(s):
@@ -105,11 +149,7 @@ def expiry_status():
     if last and now < last:
         now = last
     if last is None or now > last:
-        ex["last"] = now.isoformat()
-        try:
-            _save(users, pw, ex)
-        except Exception:
-            pass
+        _write_last(now.isoformat())
     left = days - max(0, (now - start).days)
     return left <= 0, max(left, 0)
 
@@ -204,6 +244,8 @@ def open_user_manager(parent):
         nex = {"days": nd, "start": sd if nd else "", "last": ""}
         if nd and nex["start"] == ex.get("start") and nd == int(ex.get("days") or 0):
             nex["last"] = ex.get("last", "")
+        else:
+            _write_last("")
         _save(items, pw, nex)
         messagebox.showinfo("사용자 관리", "저장했습니다.", parent=dlg)
         dlg.destroy()
