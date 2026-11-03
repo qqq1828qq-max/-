@@ -20,7 +20,10 @@ _E_USERS = [str(u) for u in getattr(_emb, "USERS", _DEFAULT_USERS)]
 _E_START = str(getattr(_emb, "START", _DEFAULT_START))
 _E_DAYS = int(getattr(_emb, "DAYS", _DEFAULT_DAYS))
 _E_PW = getattr(_emb, "PW", None)
-_E_BUILD = str(getattr(_emb, "BUILD", ""))
+_E_BUILD = hashlib.sha256(json.dumps([_E_USERS, _E_START, _E_DAYS, _E_PW, str(getattr(_emb, "BUILD", ""))],
+                                      sort_keys=True).encode("utf-8")).hexdigest()[:16]
+# _E_BUILD: 기본 설정(사번/시작일/기간/비밀번호)의 지문 — 코드의 기본값이나 admin_config.txt를 바꾸면 달라져서,
+# 이전에 이 PC에서 관리 창으로 저장해 둔 덮어쓰기 값은 자동으로 무시된다.
 
 
 # 설정은 파일로 만들지 않고 현재 사용자 레지스트리(HKCU)에 난독화해서 저장한다 — exe 폴더에 눈에 보이는 파일이 생기지 않는다.
