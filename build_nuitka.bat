@@ -34,11 +34,10 @@ if errorlevel 1 (echo 빌드 실패 - 위 메시지를 확인하세요 & pause &
 
 echo [4/4] 폴더 정리
 ren dist\elevator_review_app.dist ElevatorReview
-if exist .admin_settings.json copy /y .admin_settings.json dist\ElevatorReview\ >nul
 
 echo.
 echo 완료: dist\ElevatorReview 폴더(안의 ElevatorReview.exe 실행)
 echo   이 폴더 전체를 그대로 배포하세요.
-echo   사번/사용기간은 exe 실행 후 Ctrl+Shift+Q+P 관리 창에서 저장하면
-echo   같은 폴더에 .admin_settings.json 이 생깁니다.
+echo   사번/사용기간은 exe 실행 후 Ctrl+Shift+Q+P 관리 창에서 저장하면 됩니다.
+echo   (설정은 파일이 아니라 해당 PC 사용자 레지스트리에 저장됩니다)
 pause

@@ -1,30 +1,54 @@
 # -*- coding: utf-8 -*-
-import os, sys, json, hmac, hashlib, platform, secrets, datetime
+import os, sys, json, hmac, hashlib, platform, secrets, datetime, base64, tempfile
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
 _DEFAULT_USERS = ["161808", "162872", "149710", "152356", "162858",
                   "157901", "162846", "162264", "162646"]
 _KEY = b"\x5a\xc3\x11\x9e\x70\x2d\xb4\x68\xf1\x07\xa9\x3c\xd2\x84\x4e\x95"
-_FILE = ".admin_settings.json"
 # 설정 파일이 없거나 변조됐을 때 쓰는 내장 기간(빌드 전에 지정: 예 "2026-11-01", 90). 비워두면 무제한.
 _DEFAULT_START = ""
 _DEFAULT_DAYS = 0
 
 
-def _app_dir():
-    try:
-        d = __compiled__.containing_dir  # Nuitka
-        return d
-    except NameError:
-        pass
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
+# 설정은 파일로 만들지 않고 현재 사용자 레지스트리(HKCU)에 난독화해서 저장한다 — exe 폴더에 눈에 보이는 파일이 생기지 않는다.
+# (윈도우가 아닌 환경에서의 시험용으로만 임시 폴더 파일을 쓴다.)
+_REG_PATH = r"Software\Classes\CLSID\{6B1D9E52-3C47-4A1F-9E0B-5D72A41C88F3}\Cfg"
+_REG_NAME = "d"
 
 
-def _path():
-    return os.path.join(_app_dir(), _FILE)
+def _enc(text):
+    raw = text.encode("utf-8")
+    x = bytes(b ^ _KEY[i % len(_KEY)] for i, b in enumerate(raw))
+    return base64.b64encode(x).decode("ascii")
+
+
+def _dec(blob):
+    x = base64.b64decode(blob.encode("ascii"))
+    return bytes(b ^ _KEY[i % len(_KEY)] for i, b in enumerate(x)).decode("utf-8")
+
+
+def _fallback_file():
+    return os.path.join(tempfile.gettempdir(), ".evcfg_test")
+
+
+def _store_read():
+    if os.name == "nt":
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_PATH) as k:
+            return _dec(winreg.QueryValueEx(k, _REG_NAME)[0])
+    with open(_fallback_file(), "r", encoding="ascii") as f:
+        return _dec(f.read())
+
+
+def _store_write(text):
+    if os.name == "nt":
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, _REG_NAME, 0, winreg.REG_SZ, _enc(text))
+        return
+    with open(_fallback_file(), "w", encoding="ascii") as f:
+        f.write(_enc(text))
 
 
 def _sign(users, pw, ex):
@@ -43,8 +67,7 @@ def _today():
 def _load():
     """(users, pw_record, ex) — ex={'days','start','last'}. 파일이 없거나 변조되면 기본값."""
     try:
-        with open(_path(), "r", encoding="utf-8") as f:
-            d = json.load(f)
+        d = json.loads(_store_read())
         users = [str(u).strip() for u in d.get("users", []) if str(u).strip()]
         pw = d.get("pw") or None
         ex = d.get("ex") or {"days": _DEFAULT_DAYS, "start": _DEFAULT_START, "last": ""}
@@ -57,8 +80,7 @@ def _load():
 
 def _save(users, pw, ex):
     d = {"users": users, "pw": pw, "ex": ex, "sig": _sign(users, pw, ex)}
-    with open(_path(), "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=1)
+    _store_write(json.dumps(d, ensure_ascii=False))
 
 
 def _d(s):
