@@ -13,8 +13,11 @@ echo [2/4] 패키지 설치
 python -m pip install --upgrade nuitka ordered-set zstandard ezdxf openpyxl
 if errorlevel 1 (echo pip 설치 실패 & pause & exit /b 1)
 
-echo [3/4] 빌드 (처음엔 C 컴파일러 다운로드를 물어보면 y 입력, 10~30분 걸릴 수 있습니다)
-python -m nuitka --onefile --assume-yes-for-downloads ^
+echo [3/4] 빌드 (폴더 방식, 처음엔 C 컴파일러 다운로드를 물어보면 y 입력, 10~30분 걸릴 수 있습니다)
+if exist dist\ElevatorReview rmdir /s /q dist\ElevatorReview
+if exist dist\elevator_review_app.dist rmdir /s /q dist\elevator_review_app.dist
+
+python -m nuitka --standalone --assume-yes-for-downloads ^
   --windows-console-mode=disable ^
   --enable-plugin=tk-inter ^
   --python-flag=no_docstrings --python-flag=-O ^
@@ -29,8 +32,13 @@ python -m nuitka --onefile --assume-yes-for-downloads ^
 
 if errorlevel 1 (echo 빌드 실패 - 위 메시지를 확인하세요 & pause & exit /b 1)
 
-echo [4/4] 완료
-echo   결과: dist\ElevatorReview.exe
-echo   배포 시 exe 옆에 .admin_settings.json 을 같이 두세요
-echo   (exe 실행 후 Ctrl+Shift+Q+P 관리 창에서 사번/시작일/기간 저장 시 생성됨)
+echo [4/4] 폴더 정리
+ren dist\elevator_review_app.dist ElevatorReview
+if exist .admin_settings.json copy /y .admin_settings.json dist\ElevatorReview\ >nul
+
+echo.
+echo 완료: dist\ElevatorReview 폴더(안의 ElevatorReview.exe 실행)
+echo   이 폴더 전체를 그대로 배포하세요.
+echo   사번/사용기간은 exe 실행 후 Ctrl+Shift+Q+P 관리 창에서 저장하면
+echo   같은 폴더에 .admin_settings.json 이 생깁니다.
 pause
